@@ -497,7 +497,8 @@ def test_bypass_injects_cache_control_on_identity(basic_api_kwargs):
 
 
 def test_bypass_injects_context_management_via_extra_body(basic_api_kwargs):
-    """context_management should be injected via extra_body."""
+    """context_management should be injected via extra_body when thinking is active."""
+    basic_api_kwargs["thinking"] = {"type": "adaptive"}
     apply_claude_code_bypass(basic_api_kwargs, "2.1.117")
 
     extra_body = basic_api_kwargs.get("extra_body", {})
@@ -509,6 +510,7 @@ def test_bypass_injects_context_management_via_extra_body(basic_api_kwargs):
 def test_bypass_skips_context_management_when_top_level_present(basic_api_kwargs):
     """If context_management is already set at top level, bypass should not inject."""
     basic_api_kwargs["context_management"] = {"edits": [{"type": "custom"}]}
+    basic_api_kwargs["thinking"] = {"type": "adaptive"}
 
     apply_claude_code_bypass(basic_api_kwargs, "2.1.117")
 
@@ -533,3 +535,11 @@ def test_bypass_uses_node_v24(basic_api_kwargs):
     headers = basic_api_kwargs["extra_headers"]
     assert headers["x-stainless-runtime-version"] == "v24.3.0"
 
+
+
+def test_bypass_skips_context_management_without_thinking(basic_api_kwargs):
+    """context_management should NOT be injected when thinking is not enabled."""
+    apply_claude_code_bypass(basic_api_kwargs, "2.1.117")
+
+    extra_body = basic_api_kwargs.get("extra_body", {})
+    assert "context_management" not in extra_body

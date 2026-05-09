@@ -632,7 +632,14 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
     # Inject context_management if not already present.  CC 2.1.117 sends
     # this to control thinking-block retention.  Must go via extra_body
     # because the Anthropic Python SDK doesn't recognize it as a kwarg.
-    if "context_management" not in api_kwargs:
+    # Only inject when thinking is enabled — the clear_thinking strategy
+    # requires thinking to be active, and auxiliary calls (vision, etc.)
+    # don't use thinking mode.
+    thinking = api_kwargs.get("thinking")
+    has_thinking = isinstance(thinking, dict) and thinking.get("type") in (
+        "adaptive", "enabled",
+    )
+    if has_thinking and "context_management" not in api_kwargs:
         extra_body = api_kwargs.setdefault("extra_body", {})
         if isinstance(extra_body, dict) and "context_management" not in extra_body:
             extra_body["context_management"] = {
