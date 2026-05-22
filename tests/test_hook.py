@@ -15,6 +15,8 @@ def _clear_bypass_finders():
         for finder in sys.meta_path
         if finder.__class__.__name__ != "_ClaudeCodeBypassFinder"
     ]
+    if hasattr(sys, "_hermes_claude_auth_hook_installed"):
+        delattr(sys, "_hermes_claude_auth_hook_installed")
 
 
 @pytest.fixture

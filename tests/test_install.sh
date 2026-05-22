@@ -71,6 +71,8 @@ SITE_PACKAGES="$("$VENV_PYTHON" -c 'import site; print(site.getsitepackages()[0]
 SITECUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
 BACKUP="$SITECUSTOMIZE.pre-hermes-claude-auth"
 PATCH_FILE="$FAKE_HOME/.hermes/patches/anthropic_billing_bypass.py"
+BOOTSTRAP_MODULE="$SITE_PACKAGES/hermes_claude_auth_bootstrap.py"
+BOOTSTRAP_PTH="$SITE_PACKAGES/hermes_claude_auth_bootstrap.pth"
 
 # Test 1: Fresh install
 T1="Test 1: Fresh install"
@@ -78,7 +80,10 @@ if "$REPO_DIR/install.sh" >/dev/null 2>&1; then
     ok=1
     assert_file_exists "$T1" "$PATCH_FILE" || ok=0
     assert_file_exists "$T1" "$SITECUSTOMIZE" || ok=0
+    assert_file_exists "$T1" "$BOOTSTRAP_MODULE" || ok=0
+    assert_file_exists "$T1" "$BOOTSTRAP_PTH" || ok=0
     assert_file_contains "$T1" "$SITECUSTOMIZE" "# hermes-claude-auth managed" || ok=0
+    assert_file_contains "$T1" "$BOOTSTRAP_PTH" "import hermes_claude_auth_bootstrap" || ok=0
     [ "$ok" -eq 1 ] && pass "$T1"
 else
     fail "$T1" "install.sh exited non-zero"
@@ -89,6 +94,8 @@ T2="Test 2: Idempotent re-install"
 if "$REPO_DIR/install.sh" >/dev/null 2>&1; then
     ok=1
     assert_file_exists "$T2" "$SITECUSTOMIZE" || ok=0
+    assert_file_exists "$T2" "$BOOTSTRAP_MODULE" || ok=0
+    assert_file_exists "$T2" "$BOOTSTRAP_PTH" || ok=0
     assert_file_contains "$T2" "$SITECUSTOMIZE" "# hermes-claude-auth managed" || ok=0
     count="$(grep -cF '# hermes-claude-auth managed' "$SITECUSTOMIZE" 2>/dev/null || true)"
     if [ "$count" -gt 1 ]; then
@@ -106,6 +113,8 @@ printf 'import sys\n# some unrelated hook\n' > "$SITECUSTOMIZE"
 if "$REPO_DIR/install.sh" >/dev/null 2>&1; then
     ok=1
     assert_file_exists "$T3" "$BACKUP" || ok=0
+    assert_file_exists "$T3" "$BOOTSTRAP_MODULE" || ok=0
+    assert_file_exists "$T3" "$BOOTSTRAP_PTH" || ok=0
     assert_file_contains "$T3" "$SITECUSTOMIZE" "# hermes-claude-auth managed" || ok=0
     assert_file_contains "$T3" "$BACKUP" "# some unrelated hook" || ok=0
     [ "$ok" -eq 1 ] && pass "$T3"
@@ -120,6 +129,8 @@ if "$REPO_DIR/uninstall.sh" >/dev/null 2>&1; then
     assert_file_exists "$T4" "$SITECUSTOMIZE" || ok=0
     assert_file_contains "$T4" "$SITECUSTOMIZE" "# some unrelated hook" || ok=0
     assert_file_not_exists "$T4" "$BACKUP" || ok=0
+    assert_file_not_exists "$T4" "$BOOTSTRAP_MODULE" || ok=0
+    assert_file_not_exists "$T4" "$BOOTSTRAP_PTH" || ok=0
     assert_file_exists "$T4" "$PATCH_FILE" || ok=0
     [ "$ok" -eq 1 ] && pass "$T4"
 else
@@ -132,6 +143,8 @@ rm -f "$SITECUSTOMIZE"
 if "$REPO_DIR/install.sh" >/dev/null 2>&1 && "$REPO_DIR/uninstall.sh" --purge >/dev/null 2>&1; then
     ok=1
     assert_file_not_exists "$T5" "$SITECUSTOMIZE" || ok=0
+    assert_file_not_exists "$T5" "$BOOTSTRAP_MODULE" || ok=0
+    assert_file_not_exists "$T5" "$BOOTSTRAP_PTH" || ok=0
     assert_file_not_exists "$T5" "$PATCH_FILE" || ok=0
     assert_dir_not_exists "$T5" "$FAKE_HOME/.hermes/patches" || ok=0
     [ "$ok" -eq 1 ] && pass "$T5"

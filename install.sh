@@ -10,6 +10,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HERMES_AGENT_DIR="$HOME/.hermes/hermes-agent"
 PATCHES_DIR="$HOME/.hermes/patches"
 MARKER="# hermes-claude-auth managed"
+BOOTSTRAP_MODULE="hermes_claude_auth_bootstrap.py"
+BOOTSTRAP_PTH="hermes_claude_auth_bootstrap.pth"
 
 if [ ! -d "$HERMES_AGENT_DIR" ]; then
     printf "${RED}[✗] hermes-agent not found at %s${RESET}\n" "$HERMES_AGENT_DIR"
@@ -62,6 +64,11 @@ fi
 chmod 644 "$SITECUSTOMIZE"
 printf "${GREEN}[✓] Installed hook into %s${RESET}\n" "$SITECUSTOMIZE"
 
+cp "$SCRIPT_DIR/$BOOTSTRAP_MODULE" "$SITE_PACKAGES/$BOOTSTRAP_MODULE"
+printf 'import hermes_claude_auth_bootstrap\n' > "$SITE_PACKAGES/$BOOTSTRAP_PTH"
+chmod 644 "$SITE_PACKAGES/$BOOTSTRAP_MODULE" "$SITE_PACKAGES/$BOOTSTRAP_PTH"
+printf "${GREEN}[✓] Installed bootstrap into %s/${RESET}\n" "$SITE_PACKAGES"
+
 # macOS: hermes-agent reads Claude subscription credentials from
 # ~/.claude/.credentials.json, but Claude Code on macOS stores them in
 # Keychain only.  Mirror the Keychain entry into the file so auth works
@@ -93,4 +100,5 @@ fi
 printf "\n${GREEN}Installation complete.${RESET}\n"
 printf "  Patch:  %s/anthropic_billing_bypass.py\n" "$PATCHES_DIR"
 printf "  Hook:   %s\n" "$SITECUSTOMIZE"
+printf "  Boot:   %s/%s\n" "$SITE_PACKAGES" "$BOOTSTRAP_PTH"
 printf "  Venv:   %s\n" "$VENV_DIR"

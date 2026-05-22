@@ -14,20 +14,31 @@ On 2026-04-04, Anthropic added server-side validation that rejects OAuth request
 - Python 3.11+
 
 ## Install
+Private fixed copy:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kristianvast/hermes-claude-auth/main/install-remote.sh | bash
+gh repo clone lucassynnott/hermes-claude-auth-fixed
+cd hermes-claude-auth-fixed
+./install.sh
 ```
 
-Or clone manually:
+Remote installer, when GitHub credentials are already configured for private repos:
 ```bash
-git clone https://github.com/kristianvast/hermes-claude-auth.git
-cd hermes-claude-auth
+gh auth setup-git
+git clone --depth 1 https://github.com/lucassynnott/hermes-claude-auth-fixed.git /tmp/hermes-claude-auth-fixed
+bash /tmp/hermes-claude-auth-fixed/install.sh
+```
+
+Or clone this private copy manually:
+```bash
+git clone https://github.com/lucassynnott/hermes-claude-auth-fixed.git
+cd hermes-claude-auth-fixed
 ./install.sh
 ```
 
 What `install.sh` does:
 - Copies `anthropic_billing_bypass.py` to `~/.hermes/patches/`
 - Installs the import hook as `sitecustomize.py` in the hermes venv's site-packages
+- Installs a `.pth` bootstrap so the hook still loads when a global `sitecustomize.py` shadows the venv-local hook
 - Restarts `hermes-gateway.service` if running
 
 ## Uninstall
@@ -47,13 +58,15 @@ What `install.sh` does:
 8. **Temperature fix**: Strips non-default `temperature` on Opus 4.6 adaptive thinking, which otherwise rejects with HTTP 400
 9. **Account metadata**: Maps `~/.claude.json::oauthAccount.accountUuid` to `metadata.user_id` (Anthropic rejected the older `account_uuid` key with HTTP 400 on 2026-04-29)
 
-Installed through a `sitecustomize.py` MetaPathFinder hook, so it runs at interpreter startup with no source modifications.
+Installed through a `sitecustomize.py` MetaPathFinder hook plus a `.pth` bootstrap. The bootstrap is important on Ubuntu/Python 3.12 systems where `/usr/lib/python3.12/sitecustomize.py` can shadow the venv-local hook.
 
 ## What gets modified
 | File | Action |
 |------|--------|
 | `~/.hermes/patches/anthropic_billing_bypass.py` | Created |
 | `<venv>/lib/pythonX.Y/site-packages/sitecustomize.py` | Created or replaced |
+| `<venv>/lib/pythonX.Y/site-packages/hermes_claude_auth_bootstrap.py` | Created |
+| `<venv>/lib/pythonX.Y/site-packages/hermes_claude_auth_bootstrap.pth` | Created |
 | hermes-agent source files | NOT modified |
 
 ## Compatibility
@@ -67,6 +80,7 @@ Installed through a `sitecustomize.py` MetaPathFinder hook, so it runs at interp
 - **"hermes-agent not found"**: Make sure Hermes is installed at `~/.hermes/hermes-agent/`
 - **"No virtualenv found"**: Set `HERMES_VENV` to point to your venv
 - **Patch not loading**: Check `journalctl --user -u hermes-gateway -n 50` for `[anthropic_billing_bypass]` or `[hermes-claude-auth]` messages
+- **Installer reports success but patch does not load**: Re-run this fixed installer. It adds a `.pth` bootstrap for Python installs where a global `sitecustomize.py` wins import resolution before the Hermes venv hook.
 
 ### Auth issues
 

@@ -36,6 +36,7 @@ fi
 removed_hook=0
 restored_hook=0
 removed_patch=0
+removed_bootstrap=0
 
 if [ -z "$VENV_DIR" ]; then
   printf '%b[—]%b No hermes venv found, skipping hook removal\n' "$YELLOW" "$RESET"
@@ -52,6 +53,8 @@ else
   else
     SITE_CUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
     BACKUP_FILE="$SITE_PACKAGES/sitecustomize.py.pre-hermes-claude-auth"
+    BOOTSTRAP_MODULE="$SITE_PACKAGES/hermes_claude_auth_bootstrap.py"
+    BOOTSTRAP_PTH="$SITE_PACKAGES/hermes_claude_auth_bootstrap.pth"
 
     if [ ! -e "$SITE_CUSTOMIZE" ]; then
       printf '%b[—]%b sitecustomize.py not found (already removed)\n' "$YELLOW" "$RESET"
@@ -67,6 +70,12 @@ else
       fi
     else
       printf '%b[—]%b sitecustomize.py not ours\n' "$YELLOW" "$RESET"
+    fi
+
+    if [ -e "$BOOTSTRAP_MODULE" ] || [ -e "$BOOTSTRAP_PTH" ]; then
+      rm -f "$BOOTSTRAP_MODULE" "$BOOTSTRAP_PTH"
+      printf '%b[✓]%b Removed bootstrap files from %s\n' "$GREEN" "$RESET" "$SITE_PACKAGES"
+      removed_bootstrap=1
     fi
   fi
 fi
@@ -107,6 +116,9 @@ elif [ "$removed_hook" -eq 1 ]; then
   printf '  - Removed sitecustomize.py hook\n'
 else
   printf '  - No hook changes needed\n'
+fi
+if [ "$removed_bootstrap" -eq 1 ]; then
+  printf '  - Removed .pth bootstrap\n'
 fi
 if [ "$removed_patch" -eq 1 ]; then
   printf '  - Removed patch file\n'

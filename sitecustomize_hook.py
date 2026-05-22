@@ -32,6 +32,9 @@ if os.path.isdir(_PATCHES_DIR) and _PATCHES_DIR not in sys.path:
 
 
 def _install_hook() -> None:
+    if getattr(sys, "_hermes_claude_auth_hook_installed", False):
+        return
+
     try:
         from importlib.abc import MetaPathFinder
         from importlib.util import find_spec
@@ -83,6 +86,7 @@ def _install_hook() -> None:
             return spec
 
     sys.meta_path.insert(0, _ClaudeCodeBypassFinder())
+    sys._hermes_claude_auth_hook_installed = True
 
 
 try:
