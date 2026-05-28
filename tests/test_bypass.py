@@ -11,6 +11,7 @@ from anthropic_billing_bypass import (
     _install_response_pascalcase_unhook,
     _model_disables_effort,
     _pascalcase_mcp_name,
+    _prepend_to_first_user_message,
     _repair_tool_pairs,
     _strip_effort,
     _unwrap_tool_name,
@@ -330,6 +331,74 @@ def test_apply_claude_code_bypass_repairs_tool_pairs_before_signing(simple_messa
     # Orphan removed; assistant message dropped (now empty after filter).
     assert len(api_kwargs["messages"]) == 1
     assert api_kwargs["messages"][0]["role"] == "user"
+
+
+def test_repair_tool_pairs_drops_late_tool_result_even_when_id_matches():
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "ordinary interloper"}]},
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "late"}],
+        },
+    ]
+
+    repaired = _repair_tool_pairs(messages)
+
+    assert all(
+        not (isinstance(block, dict) and block.get("type") in {"tool_use", "tool_result"})
+        for msg in repaired if isinstance(msg, dict)
+        for block in (msg.get("content") if isinstance(msg.get("content"), list) else [])
+    )
+
+
+def test_repair_tool_pairs_requires_tool_result_as_first_user_block():
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "bad prefix"},
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+            ],
+        },
+    ]
+
+    repaired = _repair_tool_pairs(messages)
+
+    assert all(
+        not (isinstance(block, dict) and block.get("type") in {"tool_use", "tool_result"})
+        for msg in repaired if isinstance(msg, dict)
+        for block in (msg.get("content") if isinstance(msg.get("content"), list) else [])
+    )
+
+
+def test_prepend_to_first_user_message_skips_tool_result_turn():
+    messages = [
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "next ordinary"}]},
+    ]
+
+    _prepend_to_first_user_message(messages, ["SYS"])
+
+    assert messages[1]["content"][0]["type"] == "tool_result"
+    assert messages[2]["content"][0]["type"] == "text"
+    assert messages[2]["content"][0]["text"].startswith("<system-reminder>")
 
 
 def test_model_disables_effort_for_haiku():

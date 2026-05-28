@@ -317,75 +317,123 @@ def _merge_spoof_extras(api_kwargs: Dict[str, Any]) -> None:
 
 
 def _repair_tool_pairs(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Strip orphaned ``tool_use`` / ``tool_result`` blocks.
+    """Repair Anthropic tool-call adjacency, not just global pairing.
 
-    Anthropic rejects requests where a ``tool_use`` has no matching
-    ``tool_result`` (or vice versa).  Long conversations or partial summaries
-    can leave these orphans behind; this function removes them and drops
-    messages whose content becomes empty as a result.
+    Anthropic's Messages API requires every assistant ``tool_use`` block to be
+    answered by matching ``tool_result`` block(s) in the *immediately next*
+    user message. Those ``tool_result`` blocks must be first in that user
+    message. A matching result later in history is still invalid and produces:
 
-    Mirrors upstream ``src/transforms.ts::repairToolPairs``.  Returns the
-    original list when nothing needs repairing so callers can detect a no-op
-    via identity comparison.
+        ``tool_use ids were found without tool_result blocks immediately after``
+
+    Older versions of this bypass only compared global sets of ids, which let
+    malformed turns through whenever hooks, summaries, or prompt relocation
+    inserted an ordinary user message between a tool call and its result.
     """
     if not isinstance(messages, list):
         return messages
 
-    tool_use_ids: Set[str] = set()
-    tool_result_ids: Set[str] = set()
-
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "tool_use":
-                bid = block.get("id")
-                if isinstance(bid, str):
-                    tool_use_ids.add(bid)
-            elif block.get("type") == "tool_result":
-                tuid = block.get("tool_use_id")
-                if isinstance(tuid, str):
-                    tool_result_ids.add(tuid)
-
-    orphaned_uses = tool_use_ids - tool_result_ids
-    orphaned_results = tool_result_ids - tool_use_ids
-
-    if not orphaned_uses and not orphaned_results:
-        return messages
-
+    changed = False
     repaired: List[Dict[str, Any]] = []
-    for msg in messages:
+    valid_tool_use_ids: Set[str] = set()
+    i = 0
+
+    while i < len(messages):
+        msg = messages[i]
         if not isinstance(msg, dict):
             repaired.append(msg)
+            i += 1
+            continue
+
+        content = msg.get("content")
+        if msg.get("role") != "assistant" or not isinstance(content, list):
+            repaired.append(msg)
+            i += 1
+            continue
+
+        tool_use_blocks = [
+            block for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "tool_use"
+            and isinstance(block.get("id"), str)
+        ]
+        if not tool_use_blocks:
+            repaired.append(msg)
+            i += 1
+            continue
+
+        expected_ids = [block["id"] for block in tool_use_blocks]
+        next_msg = messages[i + 1] if i + 1 < len(messages) else None
+        next_content = next_msg.get("content") if isinstance(next_msg, dict) else None
+
+        immediate_result_ids: List[str] = []
+        if (
+            isinstance(next_msg, dict)
+            and next_msg.get("role") == "user"
+            and isinstance(next_content, list)
+        ):
+            for block in next_content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    break
+                tool_use_id = block.get("tool_use_id")
+                if isinstance(tool_use_id, str):
+                    immediate_result_ids.append(tool_use_id)
+
+        valid_ids = set(expected_ids).intersection(immediate_result_ids)
+        if valid_ids != set(expected_ids):
+            changed = True
+            filtered_content = [
+                block for block in content
+                if not (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("id") not in valid_ids
+                )
+            ]
+            if filtered_content:
+                repaired.append({**msg, "content": filtered_content})
+                valid_tool_use_ids.update(valid_ids)
+            # If the assistant message only contained invalid tool_use blocks,
+            # drop it. Keeping a placeholder assistant before an ordinary user
+            # message can create fresh alternation weirdness after Hermes merges.
+        else:
+            repaired.append(msg)
+            valid_tool_use_ids.update(expected_ids)
+        i += 1
+
+    # Second pass: drop tool_result blocks that do not correspond to a tool_use
+    # kept by the adjacency pass. Preserve non-tool content, but never allow it
+    # before remaining tool_result blocks in the same user message.
+    final: List[Dict[str, Any]] = []
+    for msg in repaired:
+        if not isinstance(msg, dict):
+            final.append(msg)
             continue
         content = msg.get("content")
-        if not isinstance(content, list):
-            repaired.append(msg)
+        if msg.get("role") != "user" or not isinstance(content, list):
+            final.append(msg)
             continue
-        filtered: List[Any] = []
+
+        kept_results: List[Any] = []
+        other_blocks: List[Any] = []
         for block in content:
-            if not isinstance(block, dict):
-                filtered.append(block)
-                continue
-            if (
-                block.get("type") == "tool_use"
-                and block.get("id") in orphaned_uses
-            ):
-                continue
-            if (
-                block.get("type") == "tool_result"
-                and block.get("tool_use_id") in orphaned_results
-            ):
-                continue
-            filtered.append(block)
-        if filtered:
-            repaired.append({**msg, "content": filtered})
-    return repaired
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                if block.get("tool_use_id") in valid_tool_use_ids:
+                    kept_results.append(block)
+                else:
+                    changed = True
+            else:
+                other_blocks.append(block)
+
+        new_content = kept_results + other_blocks
+        if new_content:
+            if new_content != content:
+                changed = True
+            final.append({**msg, "content": new_content})
+        else:
+            changed = True
+
+    return final if changed else messages
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +524,20 @@ def _prepend_to_first_user_message(
         if not isinstance(msg, dict) or msg.get("role") != "user":
             continue
         content = msg.get("content")
+
+        # Never prepend ordinary text before tool_result blocks. Anthropic
+        # requires tool_result blocks to be first in the immediately-following
+        # user message after an assistant tool_use. If the first user turn is a
+        # tool-result reply, skip it and relocate the system reminder into the
+        # next ordinary user turn instead.
+        if (
+            isinstance(content, list)
+            and content
+            and isinstance(content[0], dict)
+            and content[0].get("type") == "tool_result"
+        ):
+            continue
+
         if isinstance(content, str):
             new_text = f"{combined}\n\n{content}" if content else combined
             messages[i] = {**msg, "content": [{"type": "text", "text": new_text}]}
@@ -496,6 +558,11 @@ def _prepend_to_first_user_message(
             return
         messages[i] = {**msg, "content": [{"type": "text", "text": combined}]}
         return
+
+    # Degenerate history: only tool-result user turns exist. Do not mutate
+    # those turns or append a consecutive user message. Dropping relocated
+    # reminders is safer than corrupting Anthropic's tool-result adjacency.
+    return
 
 
 # ---------------------------------------------------------------------------
