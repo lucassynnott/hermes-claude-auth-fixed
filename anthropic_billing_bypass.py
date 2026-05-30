@@ -11,10 +11,19 @@ ports its bypass behaviors to Python.
 
 Version history
 ---------------
-- 1.5.4 (2026-05-30): Fix: _rewrite_tool_names skips messages carrying
-  signed thinking/redacted_thinking blocks to prevent HTTP 400 "cannot
-  be modified" on Anthropic replay.  Even wrapping a tool_use name
-  mutates the byte content and invalidates the cryptographic signature.
+- 1.5.5 (2026-05-30): Fix: _strip_thinking_from_replay removes signed
+  thinking/redacted_thinking blocks from ALL assistant messages before
+  tool-name rewriting.  Hermes round-trips reorder thinking vs tool_use
+  blocks, making Anthropic signature validation impossible — byte-identical
+  replay cannot be achieved.  Strip thinking blocks pre-emptively (not via
+  conversation_loop recovery which triggers the "cannot be modified" 400
+  by mutating the latest assistant message).  The model still generates
+  fresh thinking for the current turn.
+- 1.5.4 (2026-05-30): REVERTED in 1.5.5.  The _has_thinking_block guard on
+  _rewrite_tool_names was counter-productive: _rewrite_tool_names MUST
+  restore tool names to their original mcp__hermes__ form for replay
+  byte-identity; skipping the rewrite left names as mcp_<name> which
+  differs from the original.
 - 1.5.3 (2026-05-30): Fix: _split_tool_results_from_followup_user_text
   no longer strips thinking blocks from the assistant message during
   interrupted tool-turn repair.  The stripping triggered Anthropic's
@@ -51,7 +60,7 @@ References
 
 from __future__ import annotations
 
-__version__ = "1.5.4"
+__version__ = "1.5.5"
 
 import hashlib
 import inspect
@@ -179,6 +188,38 @@ def _has_thinking_block(msg: Dict[str, Any]) -> bool:
     return False
 
 
+def _strip_thinking_from_replay(messages: List[Dict[str, Any]]) -> None:
+    """Strip ``thinking`` / ``redacted_thinking`` blocks from all assistant
+    messages in-place.
+
+    Anthropic signs thinking blocks against the full turn content including
+    block ordering.  Hermes normalisation splits thinking blocks into
+    ``reasoning_details`` and tool_use blocks into ``tool_calls``, losing the
+    original interleaved order.  On replay, ``_convert_assistant_message``
+    prepends all thinking blocks then appends all tool_use blocks — the
+    reordering invalidates every signature.
+
+    Since a byte-identical replay is impossible after Hermes round-trips the
+    message, strip signed thinking blocks from ALL assistant messages (not
+    just non-latest as ``_manage_thinking_signatures`` does).  The model can
+    still generate new thinking blocks on the current turn; only previous-turn
+    replay thinking is removed.
+    """
+    _THINKING_TYPES = frozenset(("thinking", "redacted_thinking"))
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        stripped = [
+            b for b in content
+            if not (isinstance(b, dict) and b.get("type") in _THINKING_TYPES)
+        ]
+        if stripped:
+            msg["content"] = stripped
+
+
 def _rewrite_tool_names(api_kwargs: Dict[str, Any]) -> None:
     tools = api_kwargs.get("tools")
     if isinstance(tools, list):
@@ -190,13 +231,6 @@ def _rewrite_tool_names(api_kwargs: Dict[str, Any]) -> None:
     if isinstance(messages, list):
         for msg in messages:
             if not isinstance(msg, dict):
-                continue
-            # Never mutate messages that carry signed thinking /
-            # redacted_thinking blocks — even re-wrapping a tool_use
-            # name inside the same message changes the byte-level
-            # content and invalidates Anthropic's cryptographic
-            # signature, producing HTTP 400 "cannot be modified".
-            if _has_thinking_block(msg):
                 continue
             content = msg.get("content")
             if not isinstance(content, list):
@@ -881,6 +915,13 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
 
     if moved_texts:
         _prepend_to_first_user_message(messages, moved_texts)
+
+    # Strip signed thinking blocks from ALL assistant messages before
+    # rewriting tool names.  Hermes' round-trip reorders thinking vs
+    # tool_use blocks (see _strip_thinking_from_replay docstring),
+    # making Anthropic signature validation impossible.  Removing them
+    # here avoids the "cannot be modified" 400.
+    _strip_thinking_from_replay(messages)
 
     _rewrite_tool_names(api_kwargs)
     _merge_spoof_extras(api_kwargs)
