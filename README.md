@@ -8,12 +8,15 @@ Patches hermes-agent at runtime to pass Anthropic's server-side OAuth content va
 On 2026-04-04, Anthropic added server-side validation that rejects OAuth requests from third-party tools. This patch adds the billing header signature and system prompt structure the API expects.
 
 ## Prerequisites
-- hermes-agent installed (`~/.hermes/hermes-agent/`)
+- hermes-agent installed (Linux/macOS: `~/.hermes/hermes-agent/`, Windows: `%LOCALAPPDATA%\hermes\hermes-agent\`)
 - Claude Code CLI authenticated (valid credentials at `~/.claude/.credentials.json`)
-- hermes-agent configured for OAuth (`credential_pool` has a `claude_code` entry in `~/.hermes/auth.json`)
+- hermes-agent configured for OAuth (`credential_pool` has a `claude_code` entry in your hermes `auth.json`)
 - Python 3.11+
+- **Windows**: PowerShell 5.1+ and Git in PATH
 
 ## Install
+
+### Linux / macOS
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kristianvast/hermes-claude-auth/main/install-remote.sh | bash
 ```
@@ -25,15 +28,37 @@ cd hermes-claude-auth
 ./install.sh
 ```
 
-What `install.sh` does:
-- Copies `anthropic_billing_bypass.py` to `~/.hermes/patches/`
+### Windows (PowerShell)
+```powershell
+irm https://raw.githubusercontent.com/kristianvast/hermes-claude-auth/main/install-remote.ps1 | iex
+```
+
+Or clone manually:
+```powershell
+git clone https://github.com/kristianvast/hermes-claude-auth.git
+cd hermes-claude-auth
+.\install.ps1
+```
+
+What the installer does:
+- Auto-detects your hermes directory (`%LOCALAPPDATA%\hermes\` on Windows, `~/.hermes/` on Linux/macOS)
+- Copies `anthropic_billing_bypass.py` to `<hermes-dir>/patches/`
 - Installs the import hook as `sitecustomize.py` in the hermes venv's site-packages
-- Restarts `hermes-gateway.service` if running
+- Mirrors Claude Code credentials from OS credential store to `~/.claude/.credentials.json` (macOS Keychain / Windows Credential Manager)
+- Restarts `hermes-gateway.service` if running (Linux only)
 
 ## Uninstall
+
+### Linux / macOS
 ```bash
 ./uninstall.sh          # remove hook only
 ./uninstall.sh --purge  # remove hook + patch file
+```
+
+### Windows (PowerShell)
+```powershell
+.\uninstall.ps1          # remove hook only
+.\uninstall.ps1 -Purge   # remove hook + patch file
 ```
 
 ## How it works
@@ -52,21 +77,24 @@ Installed through a `sitecustomize.py` MetaPathFinder hook, so it runs at interp
 ## What gets modified
 | File | Action |
 |------|--------|
-| `~/.hermes/patches/anthropic_billing_bypass.py` | Created |
-| `<venv>/lib/pythonX.Y/site-packages/sitecustomize.py` | Created or replaced |
+| `<hermes-dir>/patches/anthropic_billing_bypass.py` | Created |
+| `<venv>/lib/pythonX.Y/site-packages/sitecustomize.py` (Linux/macOS) | Created or replaced |
+| `<venv>\Lib\site-packages\sitecustomize.py` (Windows) | Created or replaced |
 | hermes-agent source files | NOT modified |
 
 ## Compatibility
 - Tested with hermes-agent on Python 3.11+
-- Linux and macOS
+- Linux, macOS, and Windows
 - Depends on `build_anthropic_kwargs(is_oauth=...)` in `agent.anthropic_adapter`, so it may need updating if hermes-agent changes that interface
 
 ## Troubleshooting
 
 ### Install issues
-- **"hermes-agent not found"**: Make sure Hermes is installed at `~/.hermes/hermes-agent/`
+- **"hermes-agent not found"**: The installer searches `%LOCALAPPDATA%\hermes\` (Windows), `~/.hermes/` (Linux/macOS), and `$HERMES_HOME` (if set). Make sure hermes-agent is in one of these locations.
 - **"No virtualenv found"**: Set `HERMES_VENV` to point to your venv
-- **Patch not loading**: Check `journalctl --user -u hermes-gateway -n 50` for `[anthropic_billing_bypass]` or `[hermes-claude-auth]` messages
+- **Patch not loading (Linux/macOS)**: Check `journalctl --user -u hermes-gateway -n 50` for `[anthropic_billing_bypass]` or `[hermes-claude-auth]` messages
+- **Patch not loading (Windows)**: Check the hermes-gateway console/log output for `[anthropic_billing_bypass]` or `[hermes-claude-auth]` messages
+- **PowerShell execution policy**: The remote installer (`irm | iex`) handles this automatically. For manual runs, use `powershell -ExecutionPolicy Bypass -File .\install.ps1`
 
 ### Auth issues
 
@@ -112,6 +140,23 @@ Installed through a `sitecustomize.py` MetaPathFinder hook, so it runs at interp
   ```
 
   Credit: the macOS Keychain mirror approach was written up by [@DrQbz](https://github.com/DrQbz) in [issue #5](https://github.com/kristianvast/hermes-claude-auth/issues/5) and is now automated in `install.sh`.
+
+  **On Windows**, `install.ps1` auto-mirrors the `Claude Code-credentials` entry from Windows Credential Manager into `~/.claude/.credentials.json` using the Win32 Credential API (analogous to the macOS Keychain mirror). Re-running the installer is usually sufficient:
+  ```powershell
+  .\install.ps1
+  ```
+  If auto-mirroring fails (e.g. PowerShell constrained language mode), re-authenticate and retry:
+  ```powershell
+  claude auth login --claudeai
+  .\install.ps1
+  ```
+  If credentials still aren't found, check Windows Credential Manager manually:
+  ```powershell
+  # List all Claude-related credentials
+  cmdkey /list:*Claude*
+  # If no entry exists, re-authenticate:
+  claude auth login --claudeai
+  ```
 
 ### Billing / routing issues
 
