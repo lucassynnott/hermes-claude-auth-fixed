@@ -11,6 +11,22 @@ ports its bypass behaviors to Python.
 
 Version history
 ---------------
+- 1.5.7 (2026-05-30): Root cause fix: preserve original Anthropic content
+  block interleaving order instead of stripping thinking blocks as a
+  workaround.  Hermes core changes:
+  (a) AnthropicTransport.normalize_response saves the raw content block
+      array (with original order) in provider_data["_anthropic_raw_content"].
+  (b) chat_completion_helpers forwards _anthropic_raw_content onto the
+      assistant message dict.
+  (c) _convert_assistant_message uses _anthropic_raw_content (fast path)
+      to replay the original block order, making signed thinking blocks
+      byte-identical to the API response — no more signature invalidation.
+  (d) _strip_thinking_from_replay now skips messages with signed thinking
+      blocks (i.e. those that went through the fast path), only stripping
+      legacy messages where block order was lost.
+  (e) error_classifier classifies "cannot be modified" as thinking_signature.
+  (f) conversation_loop recovery strips reasoning_content alongside
+      reasoning_details to prevent re-synthesis of unsigned thinking blocks.
 - 1.5.6 (2026-05-30): Fix: _strip_thinking_from_replay now handles the edge
   case where ALL content blocks in an assistant message are thinking blocks.
   Previously the empty-list check `if stripped:` was False for `[]`, leaving
@@ -198,21 +214,20 @@ def _has_thinking_block(msg: Dict[str, Any]) -> bool:
 
 
 def _strip_thinking_from_replay(messages: List[Dict[str, Any]]) -> None:
-    """Strip ``thinking`` / ``redacted_thinking`` blocks from all assistant
-    messages in-place.
+    """Strip ``thinking`` / ``redacted_thinking`` blocks from assistant
+    messages that lack ``_anthropic_raw_content`` (legacy messages where
+    original block order was not preserved).
 
-    Anthropic signs thinking blocks against the full turn content including
-    block ordering.  Hermes normalisation splits thinking blocks into
-    ``reasoning_details`` and tool_use blocks into ``tool_calls``, losing the
-    original interleaved order.  On replay, ``_convert_assistant_message``
-    prepends all thinking blocks then appends all tool_use blocks — the
-    reordering invalidates every signature.
+    When ``_anthropic_raw_content`` is present, ``_convert_assistant_message``
+    replays the original interleaved block order, so signatures remain valid
+    and stripping is unnecessary.
 
-    Since a byte-identical replay is impossible after Hermes round-trips the
-    message, strip signed thinking blocks from ALL assistant messages (not
-    just non-latest as ``_manage_thinking_signatures`` does).  The model can
-    still generate new thinking blocks on the current turn; only previous-turn
-    replay thinking is removed.
+    For legacy messages (without raw content preservation), Hermes
+    normalisation splits thinking blocks into ``reasoning_details`` and
+    tool_use blocks into ``tool_calls``, losing the original interleaved
+    order.  On replay, ``_convert_assistant_message`` prepends all thinking
+    blocks then appends all tool_use blocks — the reordering invalidates
+    every signature.  Strip thinking blocks from these messages only.
     """
     _THINKING_TYPES = frozenset(("thinking", "redacted_thinking"))
     for msg in messages:
@@ -220,6 +235,23 @@ def _strip_thinking_from_replay(messages: List[Dict[str, Any]]) -> None:
             continue
         content = msg.get("content")
         if not isinstance(content, list):
+            continue
+        # Skip messages that carry preserved raw content — their block
+        # order is already correct and thinking signatures are valid.
+        # Note: at this point we're looking at Anthropic-format messages
+        # (after convert_messages_to_anthropic).  The raw_content fast path
+        # in _convert_assistant_message already produced correctly-ordered
+        # blocks, so we can detect it by checking if any thinking block has
+        # a valid signature (signed blocks from the fast path are intact).
+        has_signed_thinking = any(
+            isinstance(b, dict)
+            and b.get("type") in _THINKING_TYPES
+            and (b.get("signature") or b.get("data"))
+            for b in content
+        )
+        if has_signed_thinking:
+            # Signed thinking blocks present — order is preserved from
+            # _anthropic_raw_content fast path.  Don't strip.
             continue
         stripped = [
             b for b in content

@@ -214,9 +214,9 @@ def test_apply_claude_code_bypass_rewrites_tool_names_to_hermes_namespace(
 
 
 def test_apply_claude_code_bypass_rewraps_tool_use_in_thinking_message():
-    """v1.5.6: thinking blocks are stripped from ALL assistant messages to
-    avoid Anthropic's \"cannot be modified\" 400.  tool_use names are still
-    re-wrapped to mcp__hermes__ form."""
+    """v1.5.7: signed thinking blocks are PRESERVED (original block order
+    maintained via _anthropic_raw_content fast path).  tool_use names are
+    still re-wrapped to mcp__hermes__ form."""
     thinking_block = {"type": "thinking", "thinking": "private", "signature": "sig"}
     api_kwargs = {
         "system": "plain",
@@ -243,11 +243,13 @@ def test_apply_claude_code_bypass_rewraps_tool_use_in_thinking_message():
     apply_claude_code_bypass(api_kwargs, "2.1.112")
 
     assistant_content = api_kwargs["messages"][1]["content"]
-    # Thinking block should be stripped (v1.5.6)
-    assert not any(
-        isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking")
-        for b in assistant_content
-    ), "thinking blocks should be stripped by _strip_thinking_from_replay"
+    # Signed thinking block should be PRESERVED (v1.5.7 — order-preserving)
+    thinking_blocks = [
+        b for b in assistant_content
+        if isinstance(b, dict) and b.get("type") == "thinking"
+    ]
+    assert len(thinking_blocks) == 1
+    assert thinking_blocks[0]["signature"] == "sig"
     # tool_use name should still be re-wrapped
     tool_use_blocks = [b for b in assistant_content if isinstance(b, dict) and b.get("type") == "tool_use"]
     assert len(tool_use_blocks) == 1
@@ -607,14 +609,17 @@ def test_response_unhook_is_idempotent():
 # ── _strip_thinking_from_replay tests (v1.5.6) ──────────────────────────────
 
 
-def test_strip_thinking_from_replay_removes_all_thinking_blocks():
-    """Strip thinking/redacted_thinking from all assistant messages."""
+def test_strip_thinking_from_replay_removes_unsigned_thinking_blocks():
+    """Strip unsigned thinking blocks (legacy messages without raw content
+    preservation) but preserve signed ones (from _anthropic_raw_content
+    fast path with valid block order)."""
     messages = [
         {"role": "user", "content": "hello"},
         {
             "role": "assistant",
             "content": [
-                {"type": "thinking", "thinking": "hmm", "signature": "sig1"},
+                # Unsigned thinking — should be stripped (legacy slow path)
+                {"type": "thinking", "thinking": "hmm"},
                 {"type": "text", "text": "response"},
             ],
         },
@@ -622,7 +627,8 @@ def test_strip_thinking_from_replay_removes_all_thinking_blocks():
         {
             "role": "assistant",
             "content": [
-                {"type": "redacted_thinking", "data": "abc"},
+                # Signed thinking — should be preserved (fast path, valid order)
+                {"type": "thinking", "thinking": "private", "signature": "sig1"},
                 {"type": "text", "text": "second response"},
             ],
         },
@@ -630,21 +636,27 @@ def test_strip_thinking_from_replay_removes_all_thinking_blocks():
 
     _strip_thinking_from_replay(messages)
 
-    for msg in messages:
-        if msg.get("role") == "assistant":
-            for block in msg["content"]:
-                assert block["type"] not in ("thinking", "redacted_thinking")
+    # First assistant (unsigned): thinking stripped
+    assert not any(
+        b.get("type") == "thinking" for b in messages[1]["content"]
+    )
+    # Second assistant (signed): thinking preserved
+    assert any(
+        b.get("type") == "thinking" and b.get("signature") == "sig1"
+        for b in messages[3]["content"]
+    )
 
 
-def test_strip_thinking_from_replay_thinking_only_message():
-    """v1.5.6 edge case: when ALL content blocks are thinking, a placeholder
+def test_strip_thinking_from_replay_unsigned_thinking_only_message():
+    """Edge case: when ALL content blocks are unsigned thinking, a placeholder
     text block must replace them to avoid empty content (Anthropic rejects it)."""
     messages = [
         {"role": "user", "content": "hello"},
         {
             "role": "assistant",
             "content": [
-                {"type": "thinking", "thinking": "private", "signature": "sig"},
+                # No signature → unsigned (legacy), should be stripped
+                {"type": "thinking", "thinking": "private"},
             ],
         },
     ]
@@ -655,6 +667,29 @@ def test_strip_thinking_from_replay_thinking_only_message():
     assert len(assistant["content"]) == 1
     assert assistant["content"][0]["type"] == "text"
     assert assistant["content"][0]["text"] == "(thinking elided)"
+
+
+def test_strip_thinking_from_replay_signed_thinking_preserved():
+    """Signed thinking blocks should be preserved (order is correct from
+    _anthropic_raw_content fast path)."""
+    messages = [
+        {"role": "user", "content": "hello"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "private", "signature": "sig"},
+                {"type": "tool_use", "id": "t1", "name": "terminal", "input": {}},
+            ],
+        },
+    ]
+
+    _strip_thinking_from_replay(messages)
+
+    # Signed thinking preserved
+    assistant = messages[1]
+    assert len(assistant["content"]) == 2
+    assert assistant["content"][0]["type"] == "thinking"
+    assert assistant["content"][0]["signature"] == "sig"
 
 
 def test_strip_thinking_from_replay_leaves_non_assistant():
