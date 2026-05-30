@@ -53,6 +53,7 @@ Installed through a `sitecustomize.py` MetaPathFinder hook, so it runs at interp
 |------|--------|
 | `~/.hermes/patches/anthropic_billing_bypass.py` | Created |
 | `<venv>/lib/pythonX.Y/site-packages/sitecustomize.py` | Created or replaced |
+| `~/.hermes/hermes-agent/.git/hooks/post-merge` | Created (auto-recovery after `hermes update`) |
 | hermes-agent source files | NOT modified |
 
 ## After Hermes Update
@@ -60,21 +61,39 @@ Installed through a `sitecustomize.py` MetaPathFinder hook, so it runs at interp
 When you run `hermes update` (which does `git pull` + `pip install`), the
 `sitecustomize.py` inside the venv may be overwritten. The patch file survives.
 
-**Check what's broken:**
+**Automatic recovery (default).** `install.sh` installs a git `post-merge` hook
+into `~/.hermes/hermes-agent/.git/hooks/`, so the moment `hermes update` runs its
+`git pull`, the hook detects the missing hook and re-runs recovery automatically.
+If the Google Antigravity plugin is also installed, its coexistence
+`sitecustomize.py` (which already contains the Claude hook) is restored first and
+this installer leaves it untouched — the two patches never clobber each other.
+
+> **Keep the clone in a persistent path** (e.g. `~/hermes-claude-auth`), **not
+> `/tmp`**. The post-merge hook looks for the installer at
+> `$HOME/hermes-claude-auth/install.sh` first; a `/tmp` clone is wiped on reboot
+> and auto-recovery silently can't run.
+
+**Check what's broken** (verifies files exist AND match the repo byte-for-byte):
 ```bash
-cd hermes-claude-auth
+cd ~/hermes-claude-auth
 ./install.sh --check
 ```
+`--check` flags **content drift** too — if the installed
+`anthropic_billing_bypass.py` differs from the repo (e.g. a hot-fix was applied
+to one but not synced to the other), it reports `[!] DRIFT` so you can sync the
+newer copy back before a clean install silently reverts it. The shared
+`sitecustomize.py` is intentionally not compared (it legitimately differs when
+the Antigravity plugin's multi-hook version is installed).
 
 **Recover (only restores sitecustomize.py + patch):**
 ```bash
-cd hermes-claude-auth
+cd ~/hermes-claude-auth
 git pull && ./install.sh --post-update
 ```
 
 **Full recovery:**
 ```bash
-cd hermes-claude-auth
+cd ~/hermes-claude-auth
 git pull && ./install.sh
 ```
 
