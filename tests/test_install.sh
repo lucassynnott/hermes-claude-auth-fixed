@@ -65,12 +65,14 @@ export HOME="$FAKE_HOME"
 
 mkdir -p "$FAKE_HOME/.hermes/hermes-agent"
 python3 -m venv "$FAKE_HOME/.hermes/hermes-agent/venv"
+mkdir -p "$FAKE_HOME/.hermes/hermes-agent/.git/hooks"
 
 VENV_PYTHON="$FAKE_HOME/.hermes/hermes-agent/venv/bin/python"
 SITE_PACKAGES="$("$VENV_PYTHON" -c 'import site; print(site.getsitepackages()[0])')"
 SITECUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
 BACKUP="$SITECUSTOMIZE.pre-hermes-claude-auth"
 PATCH_FILE="$FAKE_HOME/.hermes/patches/anthropic_billing_bypass.py"
+POST_MERGE_HOOK="$FAKE_HOME/.hermes/hermes-agent/.git/hooks/post-merge"
 
 # Test 1: Fresh install
 T1="Test 1: Fresh install"
@@ -78,7 +80,13 @@ if "$REPO_DIR/install.sh" >/dev/null 2>&1; then
     ok=1
     assert_file_exists "$T1" "$PATCH_FILE" || ok=0
     assert_file_exists "$T1" "$SITECUSTOMIZE" || ok=0
+    assert_file_exists "$T1" "$POST_MERGE_HOOK" || ok=0
     assert_file_contains "$T1" "$SITECUSTOMIZE" "# hermes-claude-auth managed" || ok=0
+    assert_file_contains "$T1" "$POST_MERGE_HOOK" "Recovering Claude Code bypass" || ok=0
+    if [ -f "$POST_MERGE_HOOK" ] && [ ! -x "$POST_MERGE_HOOK" ]; then
+        fail "$T1" "post-merge hook is not executable"
+        ok=0
+    fi
     [ "$ok" -eq 1 ] && pass "$T1"
 else
     fail "$T1" "install.sh exited non-zero"
@@ -98,6 +106,14 @@ if "$REPO_DIR/install.sh" >/dev/null 2>&1; then
     [ "$ok" -eq 1 ] && pass "$T2"
 else
     fail "$T2" "install.sh exited non-zero on re-run"
+fi
+
+# Test 2b: Check mode verifies installed files and auto-recovery hook
+T2B="Test 2b: Check mode"
+if "$REPO_DIR/install.sh" --check >/dev/null 2>&1; then
+    pass "$T2B"
+else
+    fail "$T2B" "install.sh --check exited non-zero"
 fi
 
 # Test 3: Install over existing sitecustomize.py (no marker)

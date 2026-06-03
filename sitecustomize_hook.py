@@ -84,8 +84,18 @@ def _make_import_hook(target_module, patcher_fn, label):
     sys.meta_path.insert(0, _ClaudeCodeBypassFinder())
 
 
+def _load_billing_bypass():
+    try:
+        import anthropic_billing_bypass
+    except ImportError:
+        return None
+    return anthropic_billing_bypass
+
+
 def _patch_anthropic_adapter(module):
-    import anthropic_billing_bypass
+    anthropic_billing_bypass = _load_billing_bypass()
+    if anthropic_billing_bypass is None:
+        return
 
     ok = anthropic_billing_bypass.apply_patches(module)
     if not ok:
@@ -96,7 +106,9 @@ def _patch_anthropic_adapter(module):
 
 
 def _patch_error_classifier(_module):
-    import anthropic_billing_bypass
+    anthropic_billing_bypass = _load_billing_bypass()
+    if anthropic_billing_bypass is None:
+        return
 
     anthropic_billing_bypass._install_thinking_replay_classifier_patch()
 

@@ -29,6 +29,46 @@ What `install.sh` does:
 - Installs the import hook as `sitecustomize.py` in the hermes venv's site-packages
 - Restarts `hermes-gateway.service` if running
 
+## Agent Handoff Prompt
+
+Use this prompt when another Hermes instance needs to install, repair, or audit
+Claude auth without losing the Antigravity provider:
+
+```text
+You are setting up hermes-claude-auth on this machine.
+
+Work from the persistent clone at ~/hermes-claude-auth. If it exists and is
+clean, run `git pull`; if it has local changes, do not overwrite them and
+report that pull was skipped. If it does not exist, run:
+`git clone https://github.com/Meapri/hermes-claude-auth.git ~/hermes-claude-auth`
+
+Then run:
+`cd ~/hermes-claude-auth && ./install.sh`
+
+After install, verify and report:
+- `./install.sh --check` passes.
+- `~/.hermes/patches/anthropic_billing_bypass.py` matches this repo.
+- The Hermes venv `sitecustomize.py` contains `# hermes-claude-auth managed`.
+- If `# hermes-antigravity managed` is also present, confirm the shared hook
+  still contains Antigravity hooks for `hermes_cli.auth`,
+  `hermes_cli.providers`, `hermes_cli.commands`, `cli`,
+  `agent.auxiliary_client`, `hermes_cli.runtime_provider`,
+  `hermes_cli.main`, `hermes_cli.model_switch`, and `api.config`.
+- Importing `agent.error_classifier` in the Hermes venv does not print a
+  `ModuleNotFoundError` traceback for `anthropic_billing_bypass`.
+- `~/.hermes/hermes-agent/.git/hooks/post-merge` exists and is executable.
+
+If Claude credentials are available, smoke-test:
+`hermes chat --provider anthropic -m claude-sonnet-4-6 -q "OK" -Q`
+
+If Antigravity is also installed and credentials are available, smoke-test:
+`hermes chat --provider google-antigravity -m gemini-3.5-flash-high -q "OK" -Q`
+
+If any smoke test cannot be run, say exactly what blocked it. Finish with the
+current git commit, whether automatic repair is installed, and the check/smoke
+results.
+```
+
 ## Uninstall
 ```bash
 ./uninstall.sh          # remove hook only
@@ -52,7 +92,7 @@ Installed through a `sitecustomize.py` MetaPathFinder hook, so it runs at interp
 | File | Action |
 |------|--------|
 | `~/.hermes/patches/anthropic_billing_bypass.py` | Created |
-| `<venv>/lib/pythonX.Y/site-packages/sitecustomize.py` | Created or replaced |
+| `<venv>/lib/pythonX.Y/site-packages/sitecustomize.py` | Created or shared with Antigravity |
 | `~/.hermes/hermes-agent/.git/hooks/post-merge` | Created (auto-recovery after `hermes update`) |
 | hermes-agent source files | NOT modified |
 
@@ -113,12 +153,40 @@ Only `sitecustomize.py` needs recovery. `--post-update` does exactly that.
 - Linux and macOS
 - Depends on `build_anthropic_kwargs(is_oauth=...)` in `agent.anthropic_adapter`, so it may need updating if hermes-agent changes that interface
 
+### Coexisting with the Google Antigravity plugin
+
+If [hermes-google-antigravity-plugin](https://github.com/Meapri/hermes-google-antigravity-plugin)
+is also installed, both share a single `sitecustomize.py` that carries **all 11
+import hooks** (2 Claude + 9 Antigravity). Two cautions:
+
+- **⚠ Don't run an old/`fix`-branch `install.sh` that lacks `--check` raw.** A
+  Claude-only installer can overwrite the shared `sitecustomize.py` and silently
+  drop the 9 Antigravity hooks, causing `Unknown provider: google-antigravity`.
+  The current installer here is coexistence-aware (it restores the shared
+  multi-hook file first and leaves it untouched), but if you ever clobber it,
+  recover by re-running the Antigravity plugin's `./scripts/repair.sh --skip-pull`.
+- The 2 Claude hooks are `agent.error_classifier` and
+  `agent.anthropic_adapter`. The shared Antigravity hook must no-op silently if
+  `anthropic_billing_bypass.py` is absent, and the Claude-only hook has the same
+  guard for clean reinstall/uninstall cycles.
+- **Verify with a real E2E call, not a bare import.** A direct
+  `python -c "import ..."` can pass while `hermes chat` still fails on
+  import-order grounds. Smoke-test each provider with an actual chat call:
+  ```bash
+  hermes chat --provider anthropic        -m claude-sonnet-4-6      -q "OK" -Q
+  hermes chat --provider google-antigravity -m gemini-3.5-flash-high -q "OK" -Q
+  ```
+
 ## Troubleshooting
 
 ### Install issues
 - **"hermes-agent not found"**: Make sure Hermes is installed at `~/.hermes/hermes-agent/`
 - **"No virtualenv found"**: Set `HERMES_VENV` to point to your venv
 - **Patch not loading**: Check `journalctl --user -u hermes-gateway -n 50` for `[anthropic_billing_bypass]` or `[hermes-claude-auth]` messages
+- **`ModuleNotFoundError: anthropic_billing_bypass` during `hermes model`**:
+  run `cd ~/hermes-claude-auth && git pull && ./install.sh`, then verify
+  `./install.sh --check`. Current hooks treat the Claude bypass as optional
+  during shared-hook startup and should not print this traceback.
 
 ### Auth issues
 

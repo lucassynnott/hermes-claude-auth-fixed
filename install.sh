@@ -76,6 +76,17 @@ if $CHECK_ONLY; then
         ALL_OK=false
     fi
 
+    POST_MERGE_HOOK="$HERMES_AGENT_DIR/.git/hooks/post-merge"
+    if [[ -f "$POST_MERGE_HOOK" && -x "$POST_MERGE_HOOK" ]] \
+        && grep -q "Recovering Claude Code bypass" "$POST_MERGE_HOOK" 2>/dev/null; then
+        printf "${GREEN}[✓] auto-recovery hook present${RESET}\n"
+    elif [[ -d "$HERMES_AGENT_DIR/.git/hooks" ]]; then
+        printf "${RED}[✗] auto-recovery hook MISSING, stale, or not executable${RESET}\n"
+        ALL_OK=false
+    else
+        printf "${YELLOW}[!] hermes-agent git hooks directory not found; auto-recovery hook not checked${RESET}\n"
+    fi
+
     # ── Content drift check: installed patch must match this repo ───────
     # File-existence alone does not catch the case where a runtime hotfix
     # was applied to the installed copy but never synced back to the repo
