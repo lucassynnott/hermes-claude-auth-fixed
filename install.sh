@@ -31,33 +31,112 @@ if [ ! -d "$HERMES_AGENT_DIR" ]; then
     exit 1
 fi
 
-if [ -n "${HERMES_VENV:-}" ] && [ -d "$HERMES_VENV" ]; then
-    VENV_DIR="$HERMES_VENV"
-elif [ -d "$HERMES_AGENT_DIR/venv" ]; then
-    VENV_DIR="$HERMES_AGENT_DIR/venv"
-elif [ -d "$HERMES_AGENT_DIR/.venv" ]; then
-    VENV_DIR="$HERMES_AGENT_DIR/.venv"
-else
-    printf "${RED}[✗] No virtualenv found in %s (checked venv/, .venv/, and \$HERMES_VENV)${RESET}\n" "$HERMES_AGENT_DIR"
+resolve_python() {
+    local dir="$1"
+    if [ -x "$dir/bin/python" ]; then
+        echo "$dir/bin/python"
+    elif [ -x "$dir/bin/python3" ]; then
+        echo "$dir/bin/python3"
+    fi
+}
+
+can_import_hermes_agent() {
+    "$1" -c "import agent.anthropic_adapter" >/dev/null 2>&1
+}
+
+site_packages_for() {
+    "$1" -c "import site; print(site.getsitepackages()[0] if site.getsitepackages() else site.getusersitepackages())" 2>/dev/null
+}
+
+install_hook_into() {
+    local py="$1"
+    local site_packages bootstrap_path pth_path sitecustomize legacy_backup
+    site_packages="$(site_packages_for "$py")" || return 1
+    if [ -z "$site_packages" ] || [ ! -d "$site_packages" ]; then
+        return 1
+    fi
+
+    bootstrap_path="$site_packages/$BOOTSTRAP_NAME"
+    pth_path="$site_packages/$PTH_NAME"
+    sitecustomize="$site_packages/sitecustomize.py"
+    legacy_backup="$sitecustomize.pre-hermes-claude-auth"
+
+    cp "$SCRIPT_DIR/$BOOTSTRAP_NAME" "$bootstrap_path"
+    chmod 644 "$bootstrap_path"
+    cp "$SCRIPT_DIR/$PTH_NAME" "$pth_path"
+    chmod 644 "$pth_path"
+
+    if [ -f "$sitecustomize" ] && grep -q "$MARKER" "$sitecustomize"; then
+        if [ -f "$legacy_backup" ]; then
+            mv "$legacy_backup" "$sitecustomize"
+            printf "${YELLOW}[~] Migrated legacy sitecustomize.py install for %s — restored original backup${RESET}\n" "$py"
+        else
+            rm -f "$sitecustomize"
+            printf "${YELLOW}[~] Migrated legacy sitecustomize.py install for %s — removed superseded hook${RESET}\n" "$py"
+        fi
+    fi
+
+    find "$site_packages" \
+        -maxdepth 3 \
+        \( -name '_hermes_claude_auth_bootstrap*.pyc' -o -name 'sitecustomize*.pyc' \) \
+        -delete 2>/dev/null || true
+
+    printf "${GREEN}[✓] Installed .pth hook into %s${RESET}\n" "$site_packages"
+}
+
+candidate_pythons() {
+    local py venv_subdir found
+    declare -A seen=()
+
+    if [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ]; then
+        printf '%s\n' "$HERMES_PYTHON"
+        seen["$HERMES_PYTHON"]=1
+    fi
+
+    if [ -n "${HERMES_VENV:-}" ] && [ -d "$HERMES_VENV" ]; then
+        py="$(resolve_python "$HERMES_VENV")"
+        if [ -n "$py" ] && [ -z "${seen[$py]:-}" ]; then printf '%s\n' "$py"; seen["$py"]=1; fi
+    fi
+
+    for venv_subdir in venv .venv; do
+        if [ -d "$HERMES_AGENT_DIR/$venv_subdir" ]; then
+            py="$(resolve_python "$HERMES_AGENT_DIR/$venv_subdir")"
+            if [ -n "$py" ] && [ -z "${seen[$py]:-}" ]; then printf '%s\n' "$py"; seen["$py"]=1; fi
+        fi
+    done
+
+    if command -v hermes >/dev/null 2>&1; then
+        found="$(command -v hermes)"
+        if head -n 1 "$found" 2>/dev/null | grep -q '^#!'; then
+            py="$(head -n 1 "$found" | sed 's/^#!//')"
+            if [ -x "$py" ] && [ -z "${seen[$py]:-}" ]; then printf '%s\n' "$py"; seen["$py"]=1; fi
+        fi
+    fi
+
+    while IFS= read -r py; do
+        [ -x "$py" ] || continue
+        if [ -z "${seen[$py]:-}" ]; then printf '%s\n' "$py"; seen["$py"]=1; fi
+    done < <(compgen -c python3 2>/dev/null | while read -r cmd; do command -v "$cmd"; done | sort -u)
+}
+
+mapfile -t CANDIDATES < <(candidate_pythons)
+INSTALL_TARGETS=()
+for py in "${CANDIDATES[@]}"; do
+    if can_import_hermes_agent "$py"; then
+        INSTALL_TARGETS+=("$py")
+    fi
+done
+
+if [ "${#INSTALL_TARGETS[@]}" -eq 0 ]; then
+    printf "${RED}[✗] No Python interpreter found that can import agent.anthropic_adapter${RESET}\n"
+    printf "    Set HERMES_VENV or HERMES_PYTHON to the Hermes interpreter and retry.\n"
     exit 1
 fi
 
-VENV_PYTHON="$VENV_DIR/bin/python"
-if [ ! -x "$VENV_PYTHON" ]; then VENV_PYTHON="$VENV_DIR/bin/python3"; fi
-if [ ! -x "$VENV_PYTHON" ]; then
-    printf "${RED}[✗] Python not found at %s${RESET}\n" "$VENV_PYTHON"
-    exit 1
-fi
-
-SITE_PACKAGES="$("$VENV_PYTHON" -c "import site; print(site.getsitepackages()[0] if site.getsitepackages() else site.getusersitepackages())")"
-if [ ! -d "$SITE_PACKAGES" ]; then
-    printf "${RED}[✗] site-packages directory does not exist: %s${RESET}\n" "$SITE_PACKAGES"
-    exit 1
-fi
-
-BOOTSTRAP_PATH="$SITE_PACKAGES/$BOOTSTRAP_NAME"
-PTH_PATH="$SITE_PACKAGES/$PTH_NAME"
-SITECUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
+PRIMARY_PYTHON="${INSTALL_TARGETS[0]}"
+PRIMARY_SITE_PACKAGES="$(site_packages_for "$PRIMARY_PYTHON")"
+BOOTSTRAP_PATH="$PRIMARY_SITE_PACKAGES/$BOOTSTRAP_NAME"
+PTH_PATH="$PRIMARY_SITE_PACKAGES/$PTH_NAME"
 
 if $CHECK_ONLY; then
     ALL_OK=true
@@ -68,19 +147,21 @@ if $CHECK_ONLY; then
         ALL_OK=false
     fi
 
-    if [[ -f "$BOOTSTRAP_PATH" ]] && grep -q "$MARKER" "$BOOTSTRAP_PATH"; then
-        printf "${GREEN}[✓] bootstrap module present${RESET}\n"
-    else
-        printf "${RED}[✗] bootstrap module MISSING or outdated${RESET}\n"
-        ALL_OK=false
-    fi
-
-    if [[ -f "$PTH_PATH" ]] && grep -q "import _hermes_claude_auth_bootstrap" "$PTH_PATH"; then
-        printf "${GREEN}[✓] .pth shim present${RESET}\n"
-    else
-        printf "${RED}[✗] .pth shim MISSING or outdated${RESET}\n"
-        ALL_OK=false
-    fi
+    for py in "${INSTALL_TARGETS[@]}"; do
+        site_packages="$(site_packages_for "$py")"
+        if [[ -f "$site_packages/$BOOTSTRAP_NAME" ]] && grep -q "$MARKER" "$site_packages/$BOOTSTRAP_NAME"; then
+            printf "${GREEN}[✓] bootstrap module present for %s${RESET}\n" "$py"
+        else
+            printf "${RED}[✗] bootstrap module missing for %s${RESET}\n" "$py"
+            ALL_OK=false
+        fi
+        if [[ -f "$site_packages/$PTH_NAME" ]] && grep -q "import _hermes_claude_auth_bootstrap" "$site_packages/$PTH_NAME"; then
+            printf "${GREEN}[✓] .pth shim present for %s${RESET}\n" "$py"
+        else
+            printf "${RED}[✗] .pth shim missing for %s${RESET}\n" "$py"
+            ALL_OK=false
+        fi
+    done
 
     POST_MERGE_HOOK="$HERMES_AGENT_DIR/.git/hooks/post-merge"
     if [[ -f "$POST_MERGE_HOOK" && -x "$POST_MERGE_HOOK" ]] \
@@ -95,21 +176,18 @@ if $CHECK_ONLY; then
 
     INSTALLED_PATCH="$PATCHES_DIR/anthropic_billing_bypass.py"
     REPO_PATCH="$SCRIPT_DIR/anthropic_billing_bypass.py"
-    if [[ -f "$INSTALLED_PATCH" && -f "$REPO_PATCH" ]]; then
-        if ! cmp -s "$INSTALLED_PATCH" "$REPO_PATCH"; then
-            printf "${YELLOW}[!] DRIFT: anthropic_billing_bypass.py differs from repo (%s)${RESET}\n" "$REPO_PATCH"
-            ALL_OK=false
-        fi
+    if [[ -f "$INSTALLED_PATCH" && -f "$REPO_PATCH" ]] && ! cmp -s "$INSTALLED_PATCH" "$REPO_PATCH"; then
+        printf "${YELLOW}[!] DRIFT: anthropic_billing_bypass.py differs from repo (%s)${RESET}\n" "$REPO_PATCH"
+        ALL_OK=false
     fi
 
     if $ALL_OK; then
         printf "\n${GREEN}Claude Code bypass patches intact.${RESET}\n"
         exit 0
-    else
-        printf "\n${YELLOW}Patches missing or drifted. To restore from repo: ./install.sh${RESET}\n"
-        printf "${YELLOW}If the installed copy is the newer one, sync it back to the repo and commit instead.${RESET}\n"
-        exit 1
     fi
+    printf "\n${YELLOW}Patches missing or drifted. To restore from repo: ./install.sh${RESET}\n"
+    printf "${YELLOW}If the installed copy is the newer one, sync it back to the repo and commit instead.${RESET}\n"
+    exit 1
 fi
 
 if $POST_UPDATE; then
@@ -122,34 +200,13 @@ mkdir -p "$PATCHES_DIR"
 cp "$SCRIPT_DIR/anthropic_billing_bypass.py" "$PATCHES_DIR/anthropic_billing_bypass.py"
 chmod 644 "$PATCHES_DIR/anthropic_billing_bypass.py"
 printf "${GREEN}[✓] Copied patch to %s/${RESET}\n" "$PATCHES_DIR"
-
 rm -rf "$PATCHES_DIR/__pycache__" 2>/dev/null || true
 
-cp "$SCRIPT_DIR/$BOOTSTRAP_NAME" "$BOOTSTRAP_PATH"
-chmod 644 "$BOOTSTRAP_PATH"
-printf "${GREEN}[✓] Installed bootstrap module into %s${RESET}\n" "$BOOTSTRAP_PATH"
+for py in "${INSTALL_TARGETS[@]}"; do
+    install_hook_into "$py"
+done
 
-cp "$SCRIPT_DIR/$PTH_NAME" "$PTH_PATH"
-chmod 644 "$PTH_PATH"
-printf "${GREEN}[✓] Installed .pth shim into %s${RESET}\n" "$PTH_PATH"
-
-LEGACY_BACKUP="$SITECUSTOMIZE.pre-hermes-claude-auth"
-if [ -f "$SITECUSTOMIZE" ] && grep -q "$MARKER" "$SITECUSTOMIZE"; then
-    if [ -f "$LEGACY_BACKUP" ]; then
-        mv "$LEGACY_BACKUP" "$SITECUSTOMIZE"
-        printf "${YELLOW}[~] Migrated legacy sitecustomize.py install — restored your original from backup${RESET}\n"
-    else
-        rm -f "$SITECUSTOMIZE"
-        printf "${YELLOW}[~] Migrated legacy sitecustomize.py install — removed superseded hook${RESET}\n"
-    fi
-fi
-
-find "$SITE_PACKAGES" \
-    -maxdepth 3 \
-    \( -name '_hermes_claude_auth_bootstrap*.pyc' -o -name 'sitecustomize*.pyc' \) \
-    -delete 2>/dev/null || true
-
-PATCH_CHECK=$("$VENV_PYTHON" -c "
+PATCH_CHECK=$("$PRIMARY_PYTHON" -c "
 import sys, os
 sys.path.insert(0, os.path.expanduser('$PATCHES_DIR'))
 try:
@@ -208,7 +265,8 @@ if $POST_UPDATE; then
 else
     printf "${GREEN}Installation complete.${RESET}\n"
     printf "\n  Patch:     %s/anthropic_billing_bypass.py\n" "$PATCHES_DIR"
-    printf "  Bootstrap: %s\n" "$BOOTSTRAP_PATH"
-    printf "  .pth shim: %s\n" "$PTH_PATH"
-    printf "  Venv:      %s\n" "$VENV_DIR"
+    printf "  Interpreters patched:\n"
+    for py in "${INSTALL_TARGETS[@]}"; do
+        printf "    - %s\n" "$py"
+    done
 fi
