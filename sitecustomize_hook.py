@@ -42,6 +42,27 @@ if os.path.isdir(_PATCHES_DIR) and _PATCHES_DIR not in sys.path:
     sys.path.insert(0, _PATCHES_DIR)
 
 
+def _apply_bypass_patch(module) -> None:  # type: ignore[no-untyped-def]
+    """Apply anthropic_billing_bypass to a loaded Hermes module.
+
+    Kept as a small helper so direct patcher tests and the import hook share
+    the same missing-module/noop behavior.
+    """
+    try:
+        import anthropic_billing_bypass
+    except ImportError:
+        return
+    anthropic_billing_bypass.apply_patches(module)
+
+
+def _patch_anthropic_adapter(module) -> None:  # type: ignore[no-untyped-def]
+    _apply_bypass_patch(module)
+
+
+def _patch_error_classifier(module) -> None:  # type: ignore[no-untyped-def]
+    _apply_bypass_patch(module)
+
+
 def _install_hook() -> None:
     try:
         from importlib.abc import MetaPathFinder
@@ -78,9 +99,7 @@ def _install_hook() -> None:
                 original_exec(module)
                 finder._patched = True
                 try:
-                    import anthropic_billing_bypass
-
-                    anthropic_billing_bypass.apply_patches(module)
+                    _patch_anthropic_adapter(module)
                 except Exception as exc:
                     import traceback
 
