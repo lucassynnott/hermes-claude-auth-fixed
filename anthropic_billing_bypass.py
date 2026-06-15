@@ -11,12 +11,54 @@ ports its bypass behaviors to Python.
 
 Version history
 ---------------
-- 1.6.0 (2026-05-08): Update wire format for CC 2.1.117 parity — new system
-  identity prefix ("Claude agent" replacing "Claude Code"), structured
-  metadata (JSON-encoded device_id + account_uuid + session_id),
-  X-Claude-Code-Session-Id header, context_management body field,
-  effort-2025-11-24 + context-management-2025-06-27 betas, Node v24.3.0
-  stainless header, cache_control on system identity entry.
+- 1.5.7 (2026-05-30): Root cause fix: preserve original Anthropic content
+  block interleaving order instead of stripping thinking blocks as a
+  workaround.  Hermes core changes:
+  (a) AnthropicTransport.normalize_response saves the raw content block
+      array (with original order) in provider_data["_anthropic_raw_content"].
+  (b) chat_completion_helpers forwards _anthropic_raw_content onto the
+      assistant message dict.
+  (c) _convert_assistant_message uses _anthropic_raw_content (fast path)
+      to replay the original block order, making signed thinking blocks
+      byte-identical to the API response — no more signature invalidation.
+  (d) _strip_thinking_from_replay now skips messages with signed thinking
+      blocks (i.e. those that went through the fast path), only stripping
+      legacy messages where block order was lost.
+  (e) error_classifier classifies "cannot be modified" as thinking_signature.
+  (f) conversation_loop recovery strips reasoning_content alongside
+      reasoning_details to prevent re-synthesis of unsigned thinking blocks.
+- 1.5.6 (2026-05-30): Fix: _strip_thinking_from_replay now handles the edge
+  case where ALL content blocks in an assistant message are thinking blocks.
+  Previously the empty-list check `if stripped:` was False for `[]`, leaving
+  the original signed thinking blocks intact and triggering the "cannot be
+  modified" 400.  Also patched Hermes core error_classifier to classify the
+  "cannot be modified" error as thinking_signature (it lacked "signature" in
+  the message text), and conversation_loop recovery to strip reasoning_content
+  alongside reasoning_details to prevent re-synthesis of unsigned thinking
+  blocks on retry.
+- 1.5.5 (2026-05-30): Fix: _strip_thinking_from_replay removes signed
+  thinking/redacted_thinking blocks from ALL assistant messages before
+  tool-name rewriting.  Hermes round-trips reorder thinking vs tool_use
+  blocks, making Anthropic signature validation impossible — byte-identical
+  replay cannot be achieved.  Strip thinking blocks pre-emptively (not via
+  conversation_loop recovery which triggers the "cannot be modified" 400
+  by mutating the latest assistant message).  The model still generates
+  fresh thinking for the current turn.
+- 1.5.4 (2026-05-30): REVERTED in 1.5.5.  The _has_thinking_block guard on
+  _rewrite_tool_names was counter-productive: _rewrite_tool_names MUST
+  restore tool names to their original mcp__hermes__ form for replay
+  byte-identity; skipping the rewrite left names as mcp_<name> which
+  differs from the original.
+- 1.5.3 (2026-05-30): Fix: _split_tool_results_from_followup_user_text
+  no longer strips thinking blocks from the assistant message during
+  interrupted tool-turn repair.  The stripping triggered Anthropic's
+  "thinking blocks cannot be modified" 400, and the standard recovery
+  path (strip reasoning_details → retry) would hit the same error again
+  because the bypass re-stripped on every retry.  The assistant is now
+  preserved byte-for-byte; Hermes core's _manage_thinking_signatures
+  handles non-latest-assistant thinking blocks on the next turn.
+- 1.5.1 (2026-05-30): Classify Anthropic's newer "latest assistant thinking
+  blocks cannot be modified" 400 as recoverable thinking replay failure.
 - 1.5.0 (2026-05-06): Fix literal ``\\n`` escapes in system-reminder text,
   lowercase Stainless headers (matches upstream JS SDK), restore Opus 4.6
   temperature stripping, port ``repair_tool_pairs`` (upstream PR #136) and
@@ -43,7 +85,7 @@ References
 
 from __future__ import annotations
 
-__version__ = "1.6.0"
+__version__ = "1.5.7"
 
 import hashlib
 import inspect
@@ -53,7 +95,6 @@ import os
 import platform
 import sys
 import traceback
-import uuid
 from typing import Any, Dict, List, Set
 
 logger = logging.getLogger("anthropic_billing_bypass")
@@ -74,12 +115,7 @@ _BILLING_ENTRYPOINT = "sdk-cli"
 # Sentinel strings — entries in system[] starting with these are kept;
 # everything else is relocated to the first user message.
 _BILLING_PREFIX = "x-anthropic-billing-header"
-# CC 2.1.117 changed the identity prefix from the old "You are Claude Code..."
-# to this new Agent SDK identity.  The server-side validator matches on the
-# identity prefix to route requests to subscription billing vs extra-usage.
-_SYSTEM_IDENTITY = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
-# Keep the old prefix for matching — hermes-agent may still inject it.
-_OLD_SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+_SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
 
 # Hermes prefixes MCP tools with ``mcp_``.  We rewrite that to the standard
 # ``mcp__<server>__<tool>`` namespace Anthropic expects from real Claude Code,
@@ -91,32 +127,14 @@ _MCP_HERMES_NAMESPACE = "mcp__hermes__"
 # match the JS SDK output exactly (HTTP headers are case-insensitive but
 # upstream's spoof uses lowercase, and so does our pre-merge code).
 _STAINLESS_PACKAGE_VERSION = "0.81.0"
-_STAINLESS_NODE_VERSION = "v24.3.0"
+_STAINLESS_NODE_VERSION = "v22.11.0"
 
 # OAuth-only beta flags appended on top of hermes-agent's built-in
 # ``claude-code-20250219`` and ``oauth-2025-04-20``.
 _EXTRA_OAUTH_BETAS = [
     "prompt-caching-scope-2026-01-05",
-    "context-management-2025-06-27",
     "advisor-tool-2026-03-01",
-    "effort-2025-11-24",
 ]
-
-# Stable per-process session ID matching CC's X-Claude-Code-Session-Id.
-_SESSION_ID = str(uuid.uuid4())
-
-# Module-level override set by the credential pool when it selects an entry
-# that has an account_uuid field.  When set, _get_account_metadata() uses
-# this instead of reading ~/.claude.json (which always points to one account).
-_active_account_uuid: str | None = None
-
-
-def set_active_account_uuid(account_uuid: str | None) -> None:
-    """Called by the credential pool after selecting a pool entry."""
-    global _active_account_uuid
-    _active_account_uuid = account_uuid
-    if account_uuid:
-        logger.debug("Bypass active account_uuid set to %s", account_uuid)
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +190,80 @@ def _unwrap_tool_name(name: Any) -> Any:
     return name
 
 
+def _has_thinking_block(msg: Dict[str, Any]) -> bool:
+    """Return True if the message contains a ``thinking`` or ``redacted_thinking`` block.
+
+    Anthropic API (Claude 4.x / 3.7 Sonnet with thinking) enforces strict
+    content-integrity on assistant messages that include thinking blocks.
+    Mutating these messages in any way triggers HTTP 400 with the error:
+    "thinking or redacted_thinking blocks in the latest assistant message
+    cannot be modified."
+    """
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        return False
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if isinstance(block, dict) and block.get("type") in (
+            "thinking",
+            "redacted_thinking",
+        ):
+            return True
+    return False
+
+
+def _strip_thinking_from_replay(messages: List[Dict[str, Any]]) -> None:
+    """Strip ``thinking`` / ``redacted_thinking`` blocks from assistant
+    messages that lack ``_anthropic_raw_content`` (legacy messages where
+    original block order was not preserved).
+
+    When ``_anthropic_raw_content`` is present, ``_convert_assistant_message``
+    replays the original interleaved block order, so signatures remain valid
+    and stripping is unnecessary.
+
+    For legacy messages (without raw content preservation), Hermes
+    normalisation splits thinking blocks into ``reasoning_details`` and
+    tool_use blocks into ``tool_calls``, losing the original interleaved
+    order.  On replay, ``_convert_assistant_message`` prepends all thinking
+    blocks then appends all tool_use blocks — the reordering invalidates
+    every signature.  Strip thinking blocks from these messages only.
+    """
+    _THINKING_TYPES = frozenset(("thinking", "redacted_thinking"))
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        # Skip messages that carry preserved raw content — their block
+        # order is already correct and thinking signatures are valid.
+        # Note: at this point we're looking at Anthropic-format messages
+        # (after convert_messages_to_anthropic).  The raw_content fast path
+        # in _convert_assistant_message already produced correctly-ordered
+        # blocks, so we can detect it by checking if any thinking block has
+        # a valid signature (signed blocks from the fast path are intact).
+        has_signed_thinking = any(
+            isinstance(b, dict)
+            and b.get("type") in _THINKING_TYPES
+            and (b.get("signature") or b.get("data"))
+            for b in content
+        )
+        if has_signed_thinking:
+            # Signed thinking blocks present — order is preserved from
+            # _anthropic_raw_content fast path.  Don't strip.
+            continue
+        stripped = [
+            b for b in content
+            if not (isinstance(b, dict) and b.get("type") in _THINKING_TYPES)
+        ]
+        if len(stripped) < len(content):
+            # Some thinking blocks were removed — apply the filtered list.
+            # Use a placeholder when ALL blocks were thinking (empty content
+            # is rejected by Anthropic).
+            msg["content"] = stripped or [{"type": "text", "text": "(thinking elided)"}]
+
+
 def _rewrite_tool_names(api_kwargs: Dict[str, Any]) -> None:
     tools = api_kwargs.get("tools")
     if isinstance(tools, list):
@@ -189,7 +281,89 @@ def _rewrite_tool_names(api_kwargs: Dict[str, Any]) -> None:
                 continue
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
+                    # Hermes stores tool calls under its local names after the
+                    # response normalizer unwraps Claude Code's
+                    # mcp__hermes__Foo namespace.  When a response also carries
+                    # signed thinking blocks, replaying the unwrapped name makes
+                    # Anthropic report that the thinking-bearing assistant
+                    # message was modified.  Re-wrap only the tool_use name;
+                    # never touch thinking/redacted_thinking blocks themselves.
                     block["name"] = _wrap_tool_name(block.get("name") or "")
+
+
+def _install_thinking_replay_classifier_patch() -> bool:
+    """Classify Anthropic's newer thinking-replay 400 as recoverable.
+
+    Core Hermes already retries ``FailoverReason.thinking_signature`` by
+    stripping ``reasoning_details`` and replaying visible/tool history.  Newer
+    Anthropic returns a different message when the latest assistant's signed
+    thinking blocks are not byte-identical: "cannot be modified".  Older Hermes
+    versions classify that as non-retryable ``format_error`` because the string
+    contains ``invalid_request_error``.  Patch the classifier early, and also
+    refresh ``agent.conversation_loop.classify_api_error`` if that module was
+    imported before this hook ran.
+    """
+    try:
+        from agent import error_classifier as ec  # type: ignore[import-not-found]
+    except Exception as exc:
+        logger.debug("Cannot import agent.error_classifier for thinking patch: %s", exc)
+        return False
+
+    if getattr(ec, "_CLAUDE_CODE_THINKING_REPLAY_PATCHED", False):
+        return True
+
+    original = getattr(ec, "classify_api_error", None)
+    reason_enum = getattr(ec, "FailoverReason", None)
+    classified_cls = getattr(ec, "ClassifiedError", None)
+    if not callable(original) or reason_enum is None or classified_cls is None:
+        return False
+
+    def patched_classify_api_error(error: Exception, *args: Any, **kwargs: Any):
+        result = original(error, *args, **kwargs)
+        try:
+            status_code = getattr(result, "status_code", None)
+            message = str(error).lower()
+            body = getattr(error, "body", None)
+            if isinstance(body, dict):
+                err_obj = body.get("error")
+                if isinstance(err_obj, dict):
+                    body_msg = str(err_obj.get("message") or "").lower()
+                    if body_msg and body_msg not in message:
+                        message = f"{message} {body_msg}"
+            if (
+                status_code == 400
+                and "thinking" in message
+                and "cannot be modified" in message
+                and "latest assistant message" in message
+            ):
+                result.reason = reason_enum.thinking_signature
+                result.retryable = True
+                result.should_compress = False
+                result.should_rotate_credential = False
+                result.should_fallback = False
+        except Exception:
+            pass
+        return result
+
+    patched_classify_api_error.__name__ = getattr(original, "__name__", "classify_api_error")
+    patched_classify_api_error.__qualname__ = getattr(
+        original, "__qualname__", patched_classify_api_error.__name__
+    )
+    patched_classify_api_error.__doc__ = getattr(original, "__doc__", None)
+    patched_classify_api_error.__module__ = getattr(original, "__module__", __name__)
+    patched_classify_api_error.__wrapped__ = original  # type: ignore[attr-defined]
+
+    ec.classify_api_error = patched_classify_api_error
+    ec._CLAUDE_CODE_THINKING_REPLAY_PATCHED = True  # type: ignore[attr-defined]
+
+    loop_mod = sys.modules.get("agent.conversation_loop")
+    if loop_mod is not None:
+        try:
+            setattr(loop_mod, "classify_api_error", patched_classify_api_error)
+        except Exception:
+            pass
+    logger.debug("[anthropic_billing_bypass] Thinking replay classifier hook installed")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -211,39 +385,15 @@ def _read_claude_config() -> Dict[str, Any]:
 def _get_account_metadata() -> Dict[str, Any]:
     """Return Anthropic-compatible request metadata.
 
-    CC 2.1.117 sends ``user_id`` as a JSON-encoded string containing
-    ``device_id``, ``account_uuid``, and ``session_id``.  Earlier versions
-    sent just the UUID.  Returns ``{}`` when the config is missing so the
-    caller can skip injecting metadata entirely.
-
-    When the credential pool has set ``_active_account_uuid`` (via
-    ``set_active_account_uuid``), that UUID is used instead of reading
-    ``~/.claude.json``.  This ensures multi-account pools route billing
-    to the correct subscription.
+    ``metadata.account_uuid`` was rejected with HTTP 400 in 2026-04-29; only
+    ``user_id`` is accepted.  Returns ``{}`` when the config or oauthAccount
+    block is missing so the caller can skip injecting metadata entirely.
     """
-    account_uuid: str | None = _active_account_uuid
-
-    if account_uuid is None:
-        # Fallback: read from ~/.claude.json (single-account path)
-        config = _read_claude_config()
-        oauth = config.get("oauthAccount") if isinstance(config, dict) else None
-        if isinstance(oauth, dict) and isinstance(oauth.get("accountUuid"), str):
-            account_uuid = oauth["accountUuid"]
-
+    config = _read_claude_config()
+    oauth = config.get("oauthAccount") if isinstance(config, dict) else None
     metadata: Dict[str, Any] = {}
-    if account_uuid:
-        # Build structured metadata matching CC 2.1.117 wire format.
-        # device_id is a SHA-256 hex string in real CC; we derive one from
-        # the account UUID so it's stable per-install.
-        device_id = hashlib.sha256(
-            f"hermes-device-{account_uuid}".encode()
-        ).hexdigest()
-        inner = json.dumps({
-            "device_id": device_id,
-            "account_uuid": account_uuid,
-            "session_id": _SESSION_ID,
-        }, separators=(",", ":"))
-        metadata["user_id"] = inner
+    if isinstance(oauth, dict) and isinstance(oauth.get("accountUuid"), str):
+        metadata["user_id"] = oauth["accountUuid"]
     return metadata
 
 
@@ -326,7 +476,7 @@ def _stainless_os() -> str:
 
 
 def _build_spoof_headers() -> Dict[str, str]:
-    """Headers real Claude Code 2.1.117 sends that hermes-agent does not.
+    """Headers real Claude Code 2.1.112 sends that hermes-agent does not.
 
     The Anthropic SDK (Stainless-generated) automatically attaches
     ``x-stainless-*`` identifying headers.  The validator cross-references
@@ -336,7 +486,6 @@ def _build_spoof_headers() -> Dict[str, str]:
     """
     return {
         "anthropic-dangerous-direct-browser-access": "true",
-        "x-claude-code-session-id": _SESSION_ID,
         "x-stainless-arch": _stainless_arch(),
         "x-stainless-lang": "js",
         "x-stainless-os": _stainless_os(),
@@ -372,27 +521,119 @@ def _merge_spoof_extras(api_kwargs: Dict[str, Any]) -> None:
 
 
 def _repair_tool_pairs(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Repair Anthropic tool-call adjacency, not just global pairing.
+    """Repair orphaned ``tool_use`` / ``tool_result`` blocks.
 
-    Anthropic's Messages API requires every assistant ``tool_use`` block to be
-    answered by matching ``tool_result`` block(s) in the *immediately next*
-    user message. Those ``tool_result`` blocks must be first in that user
-    message. A matching result later in history is still invalid and produces:
+    Anthropic rejects requests where a ``tool_use`` has no matching
+    ``tool_result`` (or vice versa).  Long conversations or partial summaries
+    can leave these orphans behind.
 
-        ``tool_use ids were found without tool_result blocks immediately after``
+    Normal messages are repaired by stripping orphaned blocks.  Assistant
+    messages containing ``thinking`` / ``redacted_thinking`` blocks are
+    preserved byte-for-byte at the content level — Anthropic enforces strict
+    content-integrity on them and rejects mutation (HTTP 400).  If such an
+    immutable assistant message contains an orphaned ``tool_use``, synthesize
+    an error ``tool_result`` in the immediately following user message instead
+    of editing the assistant content.
 
-    Older versions of this bypass only compared global sets of ids, which let
-    malformed turns through whenever hooks, summaries, or prompt relocation
-    inserted an ordinary user message between a tool call and its result.
+    Returns the original list when nothing needs repairing so callers can
+    detect a no-op via identity comparison.
     """
     if not isinstance(messages, list):
         return messages
 
-    changed = False
-    repaired: List[Dict[str, Any]] = []
-    valid_tool_use_ids: Set[str] = set()
-    i = 0
+    tool_use_ids: Set[str] = set()
+    tool_result_ids: Set[str] = set()
 
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                bid = block.get("id")
+                if isinstance(bid, str):
+                    tool_use_ids.add(bid)
+            elif block.get("type") == "tool_result":
+                tuid = block.get("tool_use_id")
+                if isinstance(tuid, str):
+                    tool_result_ids.add(tuid)
+
+    orphaned_uses = tool_use_ids - tool_result_ids
+    orphaned_results = tool_result_ids - tool_use_ids
+
+    if not orphaned_uses and not orphaned_results:
+        return messages
+
+    thinking_orphaned_uses: Set[str] = set()
+    for msg in messages:
+        if not isinstance(msg, dict) or not _has_thinking_block(msg):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            bid = block.get("id")
+            if isinstance(bid, str) and bid in orphaned_uses:
+                thinking_orphaned_uses.add(bid)
+
+    removable_orphaned_uses = orphaned_uses - thinking_orphaned_uses
+
+    def _synthetic_tool_result(tool_use_id: str) -> Dict[str, Any]:
+        return {
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": "[Hermes repair: missing tool result synthesized for an earlier tool_use.]",
+            "is_error": True,
+        }
+
+    def _filtered_message(
+        msg: Dict[str, Any], prepend_results_for: List[str] | None = None
+    ) -> Dict[str, Any] | None:
+        prepend_results_for = prepend_results_for or []
+        synthetic_results = [_synthetic_tool_result(tid) for tid in prepend_results_for]
+        content = msg.get("content")
+
+        if not isinstance(content, list):
+            if synthetic_results and msg.get("role") == "user":
+                if isinstance(content, str):
+                    return {
+                        **msg,
+                        "content": [
+                            *synthetic_results,
+                            {"type": "text", "text": content},
+                        ],
+                    }
+                return {**msg, "content": synthetic_results}
+            return msg
+
+        filtered: List[Any] = [*synthetic_results]
+        for block in content:
+            if not isinstance(block, dict):
+                filtered.append(block)
+                continue
+            if (
+                block.get("type") == "tool_use"
+                and block.get("id") in removable_orphaned_uses
+            ):
+                continue
+            if (
+                block.get("type") == "tool_result"
+                and block.get("tool_use_id") in orphaned_results
+            ):
+                continue
+            filtered.append(block)
+        if filtered:
+            return {**msg, "content": filtered}
+        return None
+
+    repaired: List[Dict[str, Any]] = []
+    i = 0
     while i < len(messages):
         msg = messages[i]
         if not isinstance(msg, dict):
@@ -400,95 +641,127 @@ def _repair_tool_pairs(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             i += 1
             continue
 
-        content = msg.get("content")
-        if msg.get("role") != "assistant" or not isinstance(content, list):
+        if _has_thinking_block(msg):
+            # Preserve thinking-bearing assistant content exactly as supplied.
             repaired.append(msg)
-            i += 1
-            continue
+            content = msg.get("content")
+            current_thinking_orphans: List[str] = []
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                        continue
+                    bid = block.get("id")
+                    if isinstance(bid, str) and bid in thinking_orphaned_uses:
+                        current_thinking_orphans.append(bid)
 
-        tool_use_blocks = [
-            block for block in content
-            if isinstance(block, dict)
-            and block.get("type") == "tool_use"
-            and isinstance(block.get("id"), str)
-        ]
-        if not tool_use_blocks:
-            repaired.append(msg)
-            i += 1
-            continue
-
-        expected_ids = [block["id"] for block in tool_use_blocks]
-        next_msg = messages[i + 1] if i + 1 < len(messages) else None
-        next_content = next_msg.get("content") if isinstance(next_msg, dict) else None
-
-        immediate_result_ids: List[str] = []
-        if (
-            isinstance(next_msg, dict)
-            and next_msg.get("role") == "user"
-            and isinstance(next_content, list)
-        ):
-            for block in next_content:
-                if not isinstance(block, dict) or block.get("type") != "tool_result":
-                    break
-                tool_use_id = block.get("tool_use_id")
-                if isinstance(tool_use_id, str):
-                    immediate_result_ids.append(tool_use_id)
-
-        valid_ids = set(expected_ids).intersection(immediate_result_ids)
-        if valid_ids != set(expected_ids):
-            changed = True
-            filtered_content = [
-                block for block in content
-                if not (
-                    isinstance(block, dict)
-                    and block.get("type") == "tool_use"
-                    and block.get("id") not in valid_ids
+            if current_thinking_orphans:
+                next_msg = messages[i + 1] if i + 1 < len(messages) else None
+                if isinstance(next_msg, dict) and next_msg.get("role") == "user":
+                    repaired_next = _filtered_message(next_msg, current_thinking_orphans)
+                    if repaired_next is not None:
+                        repaired.append(repaired_next)
+                    i += 2
+                    continue
+                repaired.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            _synthetic_tool_result(tid)
+                            for tid in current_thinking_orphans
+                        ],
+                    }
                 )
-            ]
-            if filtered_content:
-                repaired.append({**msg, "content": filtered_content})
-                valid_tool_use_ids.update(valid_ids)
-            # If the assistant message only contained invalid tool_use blocks,
-            # drop it. Keeping a placeholder assistant before an ordinary user
-            # message can create fresh alternation weirdness after Hermes merges.
-        else:
-            repaired.append(msg)
-            valid_tool_use_ids.update(expected_ids)
+            i += 1
+            continue
+
+        repaired_msg = _filtered_message(msg)
+        if repaired_msg is not None:
+            repaired.append(repaired_msg)
         i += 1
 
-    # Second pass: drop tool_result blocks that do not correspond to a tool_use
-    # kept by the adjacency pass. Preserve non-tool content, but never allow it
-    # before remaining tool_result blocks in the same user message.
-    final: List[Dict[str, Any]] = []
-    for msg in repaired:
-        if not isinstance(msg, dict):
-            final.append(msg)
-            continue
-        content = msg.get("content")
-        if msg.get("role") != "user" or not isinstance(content, list):
-            final.append(msg)
-            continue
+    return repaired
 
-        kept_results: List[Any] = []
-        other_blocks: List[Any] = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "tool_result":
-                if block.get("tool_use_id") in valid_tool_use_ids:
-                    kept_results.append(block)
+
+def _split_tool_results_from_followup_user_text(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Split merged tool-result user turns from later natural user text.
+
+    Hermes's Anthropic adapter merges consecutive user messages to enforce role
+    alternation.  If an assistant tool-use turn failed before producing the next
+    assistant response, the stored history can become:
+
+        assistant(thinking + tool_use), user(tool_result..., text new prompt)
+
+    For signed Anthropic thinking, that text was not part of the original
+    tool-result continuation and can make the server report that the thinking
+    block was modified.  Split it into a completed tool-result turn, a small
+    synthetic assistant bridge, then the later user text.
+    """
+    if not isinstance(messages, list):
+        return messages
+
+    changed = False
+    repaired: List[Dict[str, Any]] = []
+    for msg in messages:
+        if (
+            repaired
+            and isinstance(msg, dict)
+            and msg.get("role") == "user"
+            and isinstance(msg.get("content"), list)
+        ):
+            prev = repaired[-1]
+            prev_content = prev.get("content") if isinstance(prev, dict) else None
+            prev_has_tool_use = (
+                isinstance(prev, dict)
+                and prev.get("role") == "assistant"
+                and isinstance(prev_content, list)
+                and any(
+                    isinstance(block, dict) and block.get("type") == "tool_use"
+                    for block in prev_content
+                )
+            )
+            content = msg["content"]
+            leading_results: List[Any] = []
+            rest: List[Any] = []
+            seen_non_result = False
+            for block in content:
+                is_tool_result = (
+                    isinstance(block, dict) and block.get("type") == "tool_result"
+                )
+                if prev_has_tool_use and is_tool_result and not seen_non_result:
+                    leading_results.append(block)
                 else:
-                    changed = True
-            else:
-                other_blocks.append(block)
-
-        new_content = kept_results + other_blocks
-        if new_content:
-            if new_content != content:
+                    seen_non_result = True
+                    rest.append(block)
+            if leading_results and rest:
+                # Interrupted/failed tool turn — the assistant + tool_result
+                # boundary was merged with later user text by Hermes's role
+                # alternation logic.  Split them apart WITHOUT modifying the
+                # assistant content so Anthropic's thinking-block integrity
+                # check does not reject the request.  Hermes core's
+                # _manage_thinking_signatures will strip thinking blocks from
+                # non-latest assistant messages on the next turn, and the
+                # standard thinking_signature recovery path handles any
+                # signature validation failures on this turn.
+                repaired.append({**msg, "content": leading_results})
+                repaired.append(
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "[Hermes repair: previous tool turn ended without an assistant response.]",
+                            }
+                        ],
+                    }
+                )
+                repaired.append({**msg, "content": rest})
                 changed = True
-            final.append({**msg, "content": new_content})
-        else:
-            changed = True
+                continue
+        repaired.append(msg)
 
-    return final if changed else messages
+    return repaired if changed else messages
 
 
 # ---------------------------------------------------------------------------
@@ -579,20 +852,6 @@ def _prepend_to_first_user_message(
         if not isinstance(msg, dict) or msg.get("role") != "user":
             continue
         content = msg.get("content")
-
-        # Never prepend ordinary text before tool_result blocks. Anthropic
-        # requires tool_result blocks to be first in the immediately-following
-        # user message after an assistant tool_use. If the first user turn is a
-        # tool-result reply, skip it and relocate the system reminder into the
-        # next ordinary user turn instead.
-        if (
-            isinstance(content, list)
-            and content
-            and isinstance(content[0], dict)
-            and content[0].get("type") == "tool_result"
-        ):
-            continue
-
         if isinstance(content, str):
             new_text = f"{combined}\n\n{content}" if content else combined
             messages[i] = {**msg, "content": [{"type": "text", "text": new_text}]}
@@ -613,11 +872,6 @@ def _prepend_to_first_user_message(
             return
         messages[i] = {**msg, "content": [{"type": "text", "text": combined}]}
         return
-
-    # Degenerate history: only tool-result user turns exist. Do not mutate
-    # those turns or append a consecutive user message. Dropping relocated
-    # reminders is safer than corrupting Anthropic's tool-result adjacency.
-    return
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +896,11 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
     if repaired is not messages:
         api_kwargs["messages"] = repaired
         messages = repaired
+
+    split_messages = _split_tool_results_from_followup_user_text(messages)
+    if split_messages is not messages:
+        api_kwargs["messages"] = split_messages
+        messages = split_messages
 
     raw_system = api_kwargs.get("system")
     if raw_system is None:
@@ -681,22 +940,12 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
         text = entry.get("text") or ""
         if text.startswith(_BILLING_PREFIX):
             continue  # stale billing header — drop
-        if text.startswith(_SYSTEM_IDENTITY) or text.startswith(_OLD_SYSTEM_IDENTITY):
+        if text.startswith(_SYSTEM_IDENTITY):
             if identity_seen:
                 continue  # duplicate — drop
             identity_seen = True
-            # Strip whichever prefix matched and relocate the remainder.
-            prefix = (
-                _SYSTEM_IDENTITY
-                if text.startswith(_SYSTEM_IDENTITY)
-                else _OLD_SYSTEM_IDENTITY
-            )
-            rest = text[len(prefix):].lstrip("\n")
-            kept.append({
-                "type": "text",
-                "text": _SYSTEM_IDENTITY,
-                "cache_control": {"type": "ephemeral", "ttl": "1h"},
-            })
+            rest = text[len(_SYSTEM_IDENTITY):].lstrip("\n")
+            kept.append({"type": "text", "text": _SYSTEM_IDENTITY})
             if rest:
                 moved_texts.append(rest)
             continue
@@ -704,38 +953,24 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
             moved_texts.append(text)
 
     if not identity_seen:
-        kept.insert(0, {
-            "type": "text",
-            "text": _SYSTEM_IDENTITY,
-            "cache_control": {"type": "ephemeral", "ttl": "1h"},
-        })
+        kept.insert(0, {"type": "text", "text": _SYSTEM_IDENTITY})
 
     api_kwargs["system"] = [billing_entry] + kept
 
     if moved_texts:
         _prepend_to_first_user_message(messages, moved_texts)
 
+    # Strip signed thinking blocks from ALL assistant messages before
+    # rewriting tool names.  Hermes' round-trip reorders thinking vs
+    # tool_use blocks (see _strip_thinking_from_replay docstring),
+    # making Anthropic signature validation impossible.  Removing them
+    # here avoids the "cannot be modified" 400.
+    _strip_thinking_from_replay(messages)
+
     _rewrite_tool_names(api_kwargs)
     _merge_spoof_extras(api_kwargs)
     _strip_effort(api_kwargs)
     _fix_temperature_for_oauth_adaptive(api_kwargs, site="build_kwargs")
-
-    # Inject context_management if not already present.  CC 2.1.117 sends
-    # this to control thinking-block retention.  Must go via extra_body
-    # because the Anthropic Python SDK doesn't recognize it as a kwarg.
-    # Only inject when thinking is enabled — the clear_thinking strategy
-    # requires thinking to be active, and auxiliary calls (vision, etc.)
-    # don't use thinking mode.
-    thinking = api_kwargs.get("thinking")
-    has_thinking = isinstance(thinking, dict) and thinking.get("type") in (
-        "adaptive", "enabled",
-    )
-    if has_thinking and "context_management" not in api_kwargs:
-        extra_body = api_kwargs.setdefault("extra_body", {})
-        if isinstance(extra_body, dict) and "context_management" not in extra_body:
-            extra_body["context_management"] = {
-                "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
-            }
 
     metadata = _get_account_metadata()
     if metadata:
@@ -827,8 +1062,8 @@ def _install_response_pascalcase_unhook(
 
         aa_module.normalize_anthropic_response = patched_normalize
         aa_module._CLAUDE_CODE_RESPONSE_UNHOOK_APPLIED = True  # type: ignore[attr-defined]
-        sys.stderr.write(
-            "[anthropic_billing_bypass] Adapter unwrap hook installed\n"
+        logger.debug(
+            "[anthropic_billing_bypass] Adapter unwrap hook installed"
         )
         any_installed = True
     elif callable(original_normalize) and already_old:
@@ -893,58 +1128,14 @@ def _install_response_pascalcase_unhook(
 
                 cls.normalize_response = patched_transport_normalize
                 cls._HERMES_MCP_UNWRAP_APPLIED = True  # type: ignore[attr-defined]
-                sys.stderr.write(
-                    "[anthropic_billing_bypass] Transport unwrap hook installed\n"
+                logger.debug(
+                    "[anthropic_billing_bypass] Transport unwrap hook installed"
                 )
                 any_installed = True
         else:
             any_installed = True
 
     return any_installed
-
-
-def _install_pool_select_hook() -> None:
-    """Wrap CredentialPool.select() to call set_active_account_uuid when
-    an anthropic pool entry with an account_uuid field is selected.
-
-    This ensures _get_account_metadata() sends the correct UUID for
-    multi-account setups instead of always reading ~/.claude.json.
-    """
-    try:
-        from agent.credential_pool import CredentialPool  # type: ignore[import-not-found]
-    except ImportError:
-        logger.debug("credential_pool not importable; pool select hook skipped")
-        return
-
-    if getattr(CredentialPool, "_BILLING_BYPASS_SELECT_HOOK", False):
-        return  # already installed
-
-    original_select = CredentialPool.select
-
-    def hooked_select(self: Any) -> Any:
-        entry = original_select(self)
-        if entry is not None and getattr(self, "provider", None) == "anthropic":
-            uuid_val = getattr(entry, "account_uuid", None)
-            if isinstance(uuid_val, str) and uuid_val:
-                set_active_account_uuid(uuid_val)
-                logger.debug(
-                    "Pool selected entry %s → account_uuid %s",
-                    getattr(entry, "label", "?"),
-                    uuid_val,
-                )
-            else:
-                # No account_uuid on this entry — clear override so
-                # _get_account_metadata falls back to ~/.claude.json.
-                set_active_account_uuid(None)
-        return entry
-
-    hooked_select.__name__ = original_select.__name__
-    hooked_select.__doc__ = original_select.__doc__
-    hooked_select.__wrapped__ = original_select  # type: ignore[attr-defined]
-
-    CredentialPool.select = hooked_select
-    CredentialPool._BILLING_BYPASS_SELECT_HOOK = True  # type: ignore[attr-defined]
-    sys.stderr.write("[anthropic_billing_bypass] Pool select hook installed\n")
 
 
 def apply_patches(anthropic_adapter_module: Any = None) -> bool:
@@ -962,6 +1153,7 @@ def apply_patches(anthropic_adapter_module: Any = None) -> bool:
             return False
 
     if getattr(aa, "_CLAUDE_CODE_BYPASS_APPLIED", False):
+        _install_thinking_replay_classifier_patch()
         return True
 
     # 1. Add the OAuth-only beta flags.
@@ -1024,8 +1216,8 @@ def apply_patches(anthropic_adapter_module: Any = None) -> bool:
 
     aa.build_anthropic_kwargs = patched_build
     aa._CLAUDE_CODE_BYPASS_APPLIED = True  # type: ignore[attr-defined]
-    sys.stderr.write("[anthropic_billing_bypass] Bypass installed\n")
+    logger.debug("[anthropic_billing_bypass] Bypass installed")
 
+    _install_thinking_replay_classifier_patch()
     _install_response_pascalcase_unhook(aa)
-    _install_pool_select_hook()
     return True

@@ -7,12 +7,24 @@ YELLOW='\033[1;33m'
 RESET='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HERMES_AGENT_DIR="$HOME/.hermes/hermes-agent"
-PATCHES_DIR="$HOME/.hermes/patches"
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+HERMES_AGENT_DIR="${HERMES_AGENT_DIR:-$HERMES_HOME/hermes-agent}"
+PATCHES_DIR="$HERMES_HOME/patches"
 MARKER="# hermes-claude-auth managed"
-BOOTSTRAP_MODULE="hermes_claude_auth_bootstrap.py"
-BOOTSTRAP_PTH="hermes_claude_auth_bootstrap.pth"
 
+# ── Parse flags ─────────────────────────────────────────────────────
+POST_UPDATE=false
+CHECK_ONLY=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --post-update) POST_UPDATE=true ;;
+        --check)       CHECK_ONLY=true ;;
+        *) ;;
+    esac
+done
+
+# ── Pre-flight checks ───────────────────────────────────────────────
 if [ ! -d "$HERMES_AGENT_DIR" ]; then
     printf "${RED}[✗] hermes-agent not found at %s${RESET}\n" "$HERMES_AGENT_DIR"
     printf "    Install hermes-agent first: https://github.com/nousresearch/hermes-agent\n"
@@ -43,36 +55,135 @@ if [ ! -d "$SITE_PACKAGES" ]; then
     exit 1
 fi
 
+SITECUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
+
+# ── --check mode: verify patch integrity ────────────────────────────
+if $CHECK_ONLY; then
+    ALL_OK=true
+    for f in "$PATCHES_DIR/anthropic_billing_bypass.py"; do
+        if [[ -f "$f" ]]; then
+            printf "${GREEN}[✓] %s${RESET}\n" "$f"
+        else
+            printf "${RED}[✗] MISSING: %s${RESET}\n" "$f"
+            ALL_OK=false
+        fi
+    done
+
+    if [[ -f "$SITECUSTOMIZE" ]] && grep -q "$MARKER" "$SITECUSTOMIZE"; then
+        printf "${GREEN}[✓] sitecustomize hook present${RESET}\n"
+    else
+        printf "${RED}[✗] sitecustomize hook MISSING or outdated${RESET}\n"
+        ALL_OK=false
+    fi
+
+    POST_MERGE_HOOK="$HERMES_AGENT_DIR/.git/hooks/post-merge"
+    if [[ -f "$POST_MERGE_HOOK" && -x "$POST_MERGE_HOOK" ]] \
+        && grep -q "Recovering Claude Code bypass" "$POST_MERGE_HOOK" 2>/dev/null; then
+        printf "${GREEN}[✓] auto-recovery hook present${RESET}\n"
+    elif [[ -d "$HERMES_AGENT_DIR/.git/hooks" ]]; then
+        printf "${RED}[✗] auto-recovery hook MISSING, stale, or not executable${RESET}\n"
+        ALL_OK=false
+    else
+        printf "${YELLOW}[!] hermes-agent git hooks directory not found; auto-recovery hook not checked${RESET}\n"
+    fi
+
+    # ── Content drift check: installed patch must match this repo ───────
+    # File-existence alone does not catch the case where a runtime hotfix
+    # was applied to the installed copy but never synced back to the repo
+    # (or vice-versa). Compare byte-for-byte and warn on any drift.
+    # NOTE: sitecustomize.py is intentionally NOT compared — it is shared
+    # with other provider patches (e.g. Antigravity) and legitimately
+    # diverges from this repo's single-provider hook.
+    INSTALLED_PATCH="$PATCHES_DIR/anthropic_billing_bypass.py"
+    REPO_PATCH="$SCRIPT_DIR/anthropic_billing_bypass.py"
+    if [[ -f "$INSTALLED_PATCH" && -f "$REPO_PATCH" ]]; then
+        if ! cmp -s "$INSTALLED_PATCH" "$REPO_PATCH"; then
+            printf "${YELLOW}[!] DRIFT: anthropic_billing_bypass.py differs from repo (%s)${RESET}\n" "$REPO_PATCH"
+            ALL_OK=false
+        fi
+    fi
+
+    if $ALL_OK; then
+        printf "\n${GREEN}Claude Code bypass patches intact.${RESET}\n"
+        exit 0
+    else
+        printf "\n${YELLOW}Patches missing or drifted. To restore from repo: ./install.sh${RESET}\n"
+        printf "${YELLOW}If the installed copy is the newer one, sync it back to the repo and commit instead.${RESET}\n"
+        exit 1
+    fi
+fi
+
+# ── Full install or post-update recovery ────────────────────────────
+if $POST_UPDATE; then
+    printf "${YELLOW}[post-update] Restoring Claude Code bypass after hermes update...${RESET}\n"
+else
+    printf "${YELLOW}[install] Installing Claude Code OAuth bypass...${RESET}\n"
+fi
+
+# ── Copy patch ──────────────────────────────────────────────────────
 mkdir -p "$PATCHES_DIR"
 cp "$SCRIPT_DIR/anthropic_billing_bypass.py" "$PATCHES_DIR/anthropic_billing_bypass.py"
 chmod 644 "$PATCHES_DIR/anthropic_billing_bypass.py"
 printf "${GREEN}[✓] Copied patch to %s/${RESET}\n" "$PATCHES_DIR"
 
-SITECUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
-
+# ── Install sitecustomize hook ──────────────────────────────────────
+# If antigravity's sitecustomize is already present, don't touch it —
+# it already includes the Claude Code hook.
+ANTIGRAVITY_MARKER="# hermes-antigravity managed"
+SITECUSTOMIZE_INSTALLED=false
 if [ ! -f "$SITECUSTOMIZE" ]; then
     cp "$SCRIPT_DIR/sitecustomize_hook.py" "$SITECUSTOMIZE"
+    SITECUSTOMIZE_INSTALLED=true
+elif grep -q "$ANTIGRAVITY_MARKER" "$SITECUSTOMIZE" 2>/dev/null; then
+    printf "${GREEN}[✓] Antigravity sitecustomize already present (includes Claude hook)${RESET}\n"
 elif grep -q "$MARKER" "$SITECUSTOMIZE"; then
     cp "$SCRIPT_DIR/sitecustomize_hook.py" "$SITECUSTOMIZE"
+    SITECUSTOMIZE_INSTALLED=true
 else
     BACKUP="$SITECUSTOMIZE.pre-hermes-claude-auth"
     cp "$SITECUSTOMIZE" "$BACKUP"
     printf "${YELLOW}[!] Backed up existing sitecustomize.py to %s${RESET}\n" "$BACKUP"
     cp "$SCRIPT_DIR/sitecustomize_hook.py" "$SITECUSTOMIZE"
+    SITECUSTOMIZE_INSTALLED=true
 fi
 
-chmod 644 "$SITECUSTOMIZE"
-printf "${GREEN}[✓] Installed hook into %s${RESET}\n" "$SITECUSTOMIZE"
+if $SITECUSTOMIZE_INSTALLED; then
+    chmod 644 "$SITECUSTOMIZE"
+    printf "${GREEN}[✓] Installed hook into %s${RESET}\n" "$SITECUSTOMIZE"
+fi
 
-cp "$SCRIPT_DIR/$BOOTSTRAP_MODULE" "$SITE_PACKAGES/$BOOTSTRAP_MODULE"
-printf 'import hermes_claude_auth_bootstrap\n' > "$SITE_PACKAGES/$BOOTSTRAP_PTH"
-chmod 644 "$SITE_PACKAGES/$BOOTSTRAP_MODULE" "$SITE_PACKAGES/$BOOTSTRAP_PTH"
-printf "${GREEN}[✓] Installed bootstrap into %s/${RESET}\n" "$SITE_PACKAGES"
+# ── Verify patch ────────────────────────────────────────────────────
+PATCH_CHECK=$("$VENV_PYTHON" -c "
+import sys, os
+sys.path.insert(0, os.path.expanduser('$PATCHES_DIR'))
+try:
+    import anthropic_billing_bypass
+    v = getattr(anthropic_billing_bypass, '__version__', 'unknown')
+    print(f'OK (v{v})')
+except Exception as e:
+    print(f'FAIL ({e})')
+" 2>/dev/null || echo "FAIL (import error)")
+printf "${GREEN}[✓] Patch integrity: %s${RESET}\n" "$PATCH_CHECK"
 
-# macOS: hermes-agent reads Claude subscription credentials from
-# ~/.claude/.credentials.json, but Claude Code on macOS stores them in
-# Keychain only.  Mirror the Keychain entry into the file so auth works
-# out of the box.  No-op on Linux (Claude Code writes the file directly).
+# ── Install auto-recovery git hook ──────────────────────────────────
+GIT_HOOKS_DIR="$HERMES_AGENT_DIR/.git/hooks"
+POST_MERGE_HOOK="$GIT_HOOKS_DIR/post-merge"
+ANTIGRAVITY_HOOK="$SCRIPT_DIR/../hermes-google-antigravity-plugin/scripts/post-merge-hook.sh"
+# Try sibling repo first, then look for standalone hook
+if [ -f "$ANTIGRAVITY_HOOK" ]; then
+    HOOK_SRC="$ANTIGRAVITY_HOOK"
+elif [ -f "$SCRIPT_DIR/post-merge-hook.sh" ]; then
+    HOOK_SRC="$SCRIPT_DIR/post-merge-hook.sh"
+else
+    HOOK_SRC=""
+fi
+if [ -d "$GIT_HOOKS_DIR" ] && [ -n "$HOOK_SRC" ] && [ -f "$HOOK_SRC" ]; then
+    cp "$HOOK_SRC" "$POST_MERGE_HOOK"
+    chmod +x "$POST_MERGE_HOOK"
+    printf "${GREEN}[✓] Installed auto-recovery hook (post-merge)${RESET}\n"
+fi
+
+# ── macOS Keychain mirror ───────────────────────────────────────────
 if [ "$(uname -s)" = "Darwin" ]; then
     CRED_FILE="$HOME/.claude/.credentials.json"
     if KEYCHAIN_CRED="$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null)"; then
@@ -90,6 +201,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
     fi
 fi
 
+# ── Restart gateway ─────────────────────────────────────────────────
 if systemctl --user is-active hermes-gateway.service >/dev/null 2>&1; then
     systemctl --user restart hermes-gateway.service
     printf "${GREEN}[✓] Restarted hermes-gateway.service${RESET}\n"
@@ -97,8 +209,13 @@ else
     printf "${YELLOW}[!] hermes-gateway not running — restart manually when ready${RESET}\n"
 fi
 
-printf "\n${GREEN}Installation complete.${RESET}\n"
-printf "  Patch:  %s/anthropic_billing_bypass.py\n" "$PATCHES_DIR"
-printf "  Hook:   %s\n" "$SITECUSTOMIZE"
-printf "  Boot:   %s/%s\n" "$SITE_PACKAGES" "$BOOTSTRAP_PTH"
-printf "  Venv:   %s\n" "$VENV_DIR"
+echo ""
+if $POST_UPDATE; then
+    echo "Post-update recovery complete."
+    echo "Verify: hermes chat --provider anthropic -m claude-sonnet-4-6 -q 'test'"
+else
+    printf "${GREEN}Installation complete.${RESET}\n"
+    printf "  Patch:  %s/anthropic_billing_bypass.py\n" "$PATCHES_DIR"
+    printf "  Hook:   %s\n" "$SITECUSTOMIZE"
+    printf "  Venv:   %s\n" "$VENV_DIR"
+fi
