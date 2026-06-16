@@ -6,6 +6,10 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 RESET='\033[0m'
 
+MARKER="# hermes-claude-auth managed"
+BOOTSTRAP_NAME="_hermes_claude_auth_bootstrap.py"
+PTH_NAME="hermes_claude_auth.pth"
+
 PURGE=0
 
 for arg in "$@"; do
@@ -24,19 +28,23 @@ for arg in "$@"; do
   esac
 done
 
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+HERMES_AGENT_DIR="${HERMES_AGENT_DIR:-$HERMES_HOME/hermes-agent}"
+
 VENV_DIR=""
 if [ -n "${HERMES_VENV:-}" ] && [ -d "${HERMES_VENV:-}" ]; then
   VENV_DIR="$HERMES_VENV"
-elif [ -d "$HOME/.hermes/hermes-agent/venv" ]; then
-  VENV_DIR="$HOME/.hermes/hermes-agent/venv"
-elif [ -d "$HOME/.hermes/hermes-agent/.venv" ]; then
-  VENV_DIR="$HOME/.hermes/hermes-agent/.venv"
+elif [ -d "$HERMES_AGENT_DIR/venv" ]; then
+  VENV_DIR="$HERMES_AGENT_DIR/venv"
+elif [ -d "$HERMES_AGENT_DIR/.venv" ]; then
+  VENV_DIR="$HERMES_AGENT_DIR/.venv"
 fi
 
-removed_hook=0
-restored_hook=0
-removed_patch=0
+removed_pth=0
 removed_bootstrap=0
+removed_legacy_hook=0
+restored_legacy_hook=0
+removed_patch=0
 
 if [ -z "$VENV_DIR" ]; then
   printf '%b[—]%b No hermes venv found, skipping hook removal\n' "$YELLOW" "$RESET"
@@ -51,51 +59,59 @@ else
   if [ -z "$SITE_PACKAGES" ]; then
     printf '%b[—]%b Could not detect site-packages, skipping hook removal\n' "$YELLOW" "$RESET"
   else
-    SITE_CUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
-    BACKUP_FILE="$SITE_PACKAGES/sitecustomize.py.pre-hermes-claude-auth"
-    BOOTSTRAP_MODULE="$SITE_PACKAGES/hermes_claude_auth_bootstrap.py"
-    BOOTSTRAP_PTH="$SITE_PACKAGES/hermes_claude_auth_bootstrap.pth"
-
-    if [ ! -e "$SITE_CUSTOMIZE" ]; then
-      printf '%b[—]%b sitecustomize.py not found (already removed)\n' "$YELLOW" "$RESET"
-    elif grep -qF '# hermes-claude-auth managed' "$SITE_CUSTOMIZE"; then
-      if [ -e "$BACKUP_FILE" ]; then
-        mv "$BACKUP_FILE" "$SITE_CUSTOMIZE"
-        printf '%b[✓]%b Restored original sitecustomize.py from backup\n' "$GREEN" "$RESET"
-        restored_hook=1
-      else
-        rm -f "$SITE_CUSTOMIZE"
-        printf '%b[✓]%b Removed hook from %s/sitecustomize.py\n' "$GREEN" "$RESET" "$SITE_PACKAGES"
-        removed_hook=1
-      fi
-    else
-      printf '%b[—]%b sitecustomize.py not ours\n' "$YELLOW" "$RESET"
+    # Remove the .pth shim
+    PTH_PATH="$SITE_PACKAGES/$PTH_NAME"
+    if [ -e "$PTH_PATH" ]; then
+      rm -f "$PTH_PATH"
+      printf '%b[✓]%b Removed .pth shim from %s\n' "$GREEN" "$RESET" "$PTH_PATH"
+      removed_pth=1
     fi
 
-    if [ -e "$BOOTSTRAP_MODULE" ] || [ -e "$BOOTSTRAP_PTH" ]; then
-      rm -f "$BOOTSTRAP_MODULE" "$BOOTSTRAP_PTH"
-      printf '%b[✓]%b Removed bootstrap files from %s\n' "$GREEN" "$RESET" "$SITE_PACKAGES"
+    # Remove the bootstrap module
+    BOOTSTRAP_PATH="$SITE_PACKAGES/$BOOTSTRAP_NAME"
+    if [ -e "$BOOTSTRAP_PATH" ]; then
+      rm -f "$BOOTSTRAP_PATH"
+      printf '%b[✓]%b Removed bootstrap module from %s\n' "$GREEN" "$RESET" "$BOOTSTRAP_PATH"
       removed_bootstrap=1
+    fi
+
+    # Clean up stale bytecode for both new and legacy files
+    find "$SITE_PACKAGES" \
+        -maxdepth 3 \
+        \( -name '_hermes_claude_auth_bootstrap*.pyc' -o -name 'sitecustomize*.pyc' \) \
+        -delete 2>/dev/null || true
+
+    # Legacy: handle a sitecustomize.py left behind by an old install.
+    SITE_CUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
+    BACKUP_FILE="$SITE_PACKAGES/sitecustomize.py.pre-hermes-claude-auth"
+
+    if [ -e "$SITE_CUSTOMIZE" ] && grep -qF "$MARKER" "$SITE_CUSTOMIZE"; then
+      if [ -e "$BACKUP_FILE" ]; then
+        mv "$BACKUP_FILE" "$SITE_CUSTOMIZE"
+        printf '%b[✓]%b Restored original sitecustomize.py from legacy backup\n' "$GREEN" "$RESET"
+        restored_legacy_hook=1
+      else
+        rm -f "$SITE_CUSTOMIZE"
+        printf '%b[✓]%b Removed legacy sitecustomize.py hook from %s\n' "$GREEN" "$RESET" "$SITE_PACKAGES"
+        removed_legacy_hook=1
+      fi
     fi
   fi
 fi
 
 if [ "$PURGE" -eq 1 ]; then
-  PATCH_DIR="$HOME/.hermes/patches"
+  PATCH_DIR="$HERMES_HOME/patches"
   PATCH_FILE="$PATCH_DIR/anthropic_billing_bypass.py"
 
   if [ -e "$PATCH_FILE" ]; then
     rm -f "$PATCH_FILE"
-    printf '%b[✓]%b Removed patch from ~/.hermes/patches/\n' "$GREEN" "$RESET"
+    printf '%b[✓]%b Removed patch from %s/\n' "$GREEN" "$RESET" "$PATCH_DIR"
     removed_patch=1
   fi
 
-  # install.sh imports the patch during verification, which can leave a
-  # Python bytecode cache behind.  Purge only this plugin's cache files so
-  # other providers sharing ~/.hermes/patches are not disturbed.
+  # Drop the pycache directory if it's still around
   if [ -d "$PATCH_DIR/__pycache__" ]; then
-    rm -f "$PATCH_DIR"/__pycache__/anthropic_billing_bypass.*.pyc
-    rmdir "$PATCH_DIR/__pycache__" 2>/dev/null || true
+    rm -rf "$PATCH_DIR/__pycache__" 2>/dev/null || true
   fi
 
   if [ -d "$PATCH_DIR" ]; then
@@ -109,13 +125,6 @@ if [ "$PURGE" -eq 1 ]; then
       rmdir "$PATCH_DIR" 2>/dev/null || true
     fi
   fi
-
-  # Remove auto-recovery git hook
-  HOOK_FILE="$HOME/.hermes/hermes-agent/.git/hooks/post-merge"
-  if [ -f "$HOOK_FILE" ] && grep -q "hermes-post-update" "$HOOK_FILE" 2>/dev/null; then
-    rm -f "$HOOK_FILE"
-    printf '%b[✓]%b Removed auto-recovery hook (post-merge)\n' "$GREEN" "$RESET"
-  fi
 fi
 
 if command -v systemctl >/dev/null 2>&1; then
@@ -125,15 +134,17 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 
 printf '%bSummary:%b\n' "$GREEN" "$RESET"
-if [ "$restored_hook" -eq 1 ]; then
-  printf '  - Restored sitecustomize.py from backup\n'
-elif [ "$removed_hook" -eq 1 ]; then
-  printf '  - Removed sitecustomize.py hook\n'
-else
-  printf '  - No hook changes needed\n'
+if [ "$removed_pth" -eq 1 ] || [ "$removed_bootstrap" -eq 1 ]; then
+  printf '  - Removed .pth shim and bootstrap module\n'
 fi
-if [ "$removed_bootstrap" -eq 1 ]; then
-  printf '  - Removed .pth bootstrap\n'
+if [ "$restored_legacy_hook" -eq 1 ]; then
+  printf '  - Restored sitecustomize.py from legacy backup\n'
+elif [ "$removed_legacy_hook" -eq 1 ]; then
+  printf '  - Removed legacy sitecustomize.py hook\n'
+fi
+if [ "$removed_pth" -eq 0 ] && [ "$removed_bootstrap" -eq 0 ] \
+   && [ "$restored_legacy_hook" -eq 0 ] && [ "$removed_legacy_hook" -eq 0 ]; then
+  printf '  - No hook changes needed\n'
 fi
 if [ "$removed_patch" -eq 1 ]; then
   printf '  - Removed patch file\n'
